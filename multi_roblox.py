@@ -165,7 +165,7 @@ RED = "#dc6464"
 AMBER = "#d8a657"
 
 MAX_LOG_LINES = 800
-APP_VERSION = "3.0"
+APP_VERSION = "3.1"
 _LOG_FILE_LOCK = threading.Lock()
 MAX_LOG_FILE_BYTES = 1024 * 1024
 
@@ -764,6 +764,16 @@ def collect_handles(pids):
     if status != 0:
         raise OSError("NtQuerySystemInformation failed: 0x%08X" % status)
 
+    # The legacy structure stores PIDs in 16 bits, so anything above 65535
+    # cannot be matched reliably. Better to say so than to silently find
+    # nothing and blame the user's permissions.
+    for wanted_pid in wanted:
+        if wanted_pid > 0xFFFF:
+            raise OSError(
+                "this Windows build only offers the legacy handle table, which "
+                "cannot represent PID %d (it stores PIDs in 16 bits). Restarting "
+                "Roblox usually gives it a smaller PID." % wanted_pid)
+
     count = int(ctypes.cast(buf, ctypes.POINTER(ULONG)).contents.value)
     entry_size = ctypes.sizeof(SYSTEM_HANDLE_ENTRY)
     # The entry array is 8-byte aligned on x64 because of the pointer field.
@@ -1021,6 +1031,9 @@ PLACE_LAUNCHER = ("https://assetgame.roblox.com/game/PlaceLauncher.ashx"
 PRIVATE_LAUNCHER = ("https://assetgame.roblox.com/game/PlaceLauncher.ashx"
                     "?request=RequestPrivateGame&browserTrackerId=%d&placeId=%s"
                     "&accessCode=&linkCode=%s")
+JOB_LAUNCHER = ("https://assetgame.roblox.com/game/PlaceLauncher.ashx"
+                "?request=RequestGameJob&browserTrackerId=%d&placeId=%s"
+                "&gameId=%s&isPlayTogetherGame=false")
 
 # Ways to start an already-signed-in client, tried in this order until one
 # produces a client that stays alive. Roblox changes what it accepts without
@@ -1047,17 +1060,26 @@ def handler_exe_from_command(cmd):
     return cmd.split(" ")[0] or None
 
 
+JOB_ID_RE = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+
+
 def parse_join_target(text):
-    """Accepts a bare place ID, a game URL, or a private-server link and
-    returns (place_id, link_code). link_code is set only for private servers."""
+    """Accepts a bare place ID, a game URL, a private-server link, or a link to
+    one specific server, and returns (place_id, link_code, job_id)."""
     t = (text or "").strip()
     if not t:
-        return None, None
+        return None, None, None
     if t.isdigit():
-        return t, None
+        return t, None, None
 
     place = None
     code = None
+    job = None
+    m = JOB_ID_RE.search(t)
+    if m:
+        job = m.group(0)
     m = re.search(r"/games/(\d+)", t)
     if m:
         place = m.group(1)
@@ -1072,15 +1094,21 @@ def parse_join_target(text):
         m = re.search(r"[?&]linkCode=([A-Za-z0-9_\-]+)", t, re.I)
         if m:
             code = m.group(1)
-    return place, code
+    return place, code, job
 
 
-def build_launch_uri(ticket, place_id=None, link_code=None):
+def build_launch_uri(ticket, place_id=None, link_code=None, job_id=None):
     """The same roblox-player: string the website builds, but handed directly
     to RobloxPlayerBeta.exe so it never touches the protocol handler (and so
     never goes through Bloxstrap)."""
     launchtime = int(time.time() * 1000)
     tracker = random.randint(100000, 175000)
+    if place_id and job_id:
+        launcher = JOB_LAUNCHER % (tracker, place_id, job_id)
+        return ("roblox-player:1+launchmode:play+gameinfo:%s+launchtime:%d"
+                "+placelauncherurl:%s+browsertrackerid:%d+robloxLocale:en_us"
+                "+gameLocale:en_us"
+                % (ticket, launchtime, quote(launcher, safe=""), tracker))
     if place_id and link_code:
         launcher = PRIVATE_LAUNCHER % (tracker, place_id, link_code)
         return ("roblox-player:1+launchmode:play+gameinfo:%s+launchtime:%d"
@@ -1099,7 +1127,7 @@ def build_launch_uri(ticket, place_id=None, link_code=None):
 
 
 def build_launch_command(exe, ticket, method, place_id=None, handler_exe=None,
-                         link_code=None):
+                         link_code=None, job_id=None):
     if method == "handler":
         # Bloxstrap/Fishstrap accept the same roblox-player: URI the website
         # produces, so the signed-in ticket goes through the bootstrapper the
@@ -1107,15 +1135,18 @@ def build_launch_command(exe, ticket, method, place_id=None, handler_exe=None,
         if not handler_exe:
             return None
         return [handler_exe, "-player",
-                build_launch_uri(ticket, place_id, link_code)]
+                build_launch_uri(ticket, place_id, link_code, job_id)]
     if method == "uri":
-        return [exe, build_launch_uri(ticket, place_id, link_code)]
+        return [exe, build_launch_uri(ticket, place_id, link_code, job_id)]
     if method == "legacy":
         return [exe, "--app", "-t", ticket]
     cmd = [exe, "--play", "-a",
            "https://auth.roblox.com/v1/authentication-ticket/redeem",
            "-t", ticket, "-b", "0"]
-    if place_id and link_code:
+    if place_id and job_id:
+        cmd += ["-j", JOB_LAUNCHER % (random.randint(100000, 175000),
+                                      place_id, job_id)]
+    elif place_id and link_code:
         cmd += ["-j", PRIVATE_LAUNCHER % (random.randint(100000, 175000),
                                           place_id, link_code)]
     elif place_id:
@@ -1258,9 +1289,17 @@ def recent_client_log(within_seconds=180):
     return newest
 
 
-def explain_exit(path=None, tail_lines=400):
+def unknown_exits_path():
+    return os.path.join(config_dir(), "unknown_exits.log")
+
+
+def explain_exit(path=None, tail_lines=400, capture_unknown=True):
     """Reads the tail of a client log and reports why the client stopped.
-    Returns (reason, worth_rejoining). Purely reading files Roblox wrote."""
+    Returns (reason, worth_rejoining). Purely reading files Roblox wrote.
+
+    The patterns below are best guesses at Roblox's wording. When none match,
+    the tail is saved to unknown_exits.log so the list can be corrected from
+    real evidence instead of more guessing."""
     path = path or recent_client_log()
     if not path:
         return None, True
@@ -1273,6 +1312,21 @@ def explain_exit(path=None, tail_lines=400):
     for needle, label, rejoin in DISCONNECT_PATTERNS:
         if needle in blob:
             return label, rejoin
+
+    if capture_unknown:
+        try:
+            if os.path.getsize(unknown_exits_path()) > 512 * 1024:
+                os.replace(unknown_exits_path(), unknown_exits_path() + ".1")
+        except OSError:
+            pass
+        try:
+            with open(unknown_exits_path(), "a", encoding="utf-8") as f:
+                f.write("\n=== %s  (no pattern matched)  from %s ===\n"
+                        % (time.strftime("%Y-%m-%d %H:%M:%S"),
+                           os.path.basename(path)))
+                f.writelines(lines[-40:])
+        except Exception:
+            pass
     return None, True
 
 
@@ -2128,7 +2182,7 @@ def authenticate(root):
 class ProfileDialog(BaseDialog):
     def __init__(self, master, name="", cookie="", place_id="", link_code="",
                  auto_rejoin=False, cores=0, allow_guest_fallback=False,
-                 monitor=0):
+                 monitor=0, job_id=""):
         super().__init__(master, "Account Profile")
 
         tk.Label(self, text="Profile name:", bg=BG, fg=TEXT).grid(
@@ -2146,11 +2200,14 @@ class ProfileDialog(BaseDialog):
         self.cookie_text.insert("1.0", cookie)
         self.cookie_text.grid(row=3, column=0, padx=12, pady=4)
 
-        tk.Label(self, text="Game to join - place ID, game link, or private "
-                            "server link (optional):",
+        tk.Label(self, text="Game to join - place ID, game link, private server "
+                            "link, or a link to one server (optional):",
                  bg=BG, fg=TEXT).grid(row=4, column=0, sticky="w", padx=12, pady=(10, 0))
         existing_join = place_id or ""
-        if place_id and link_code:
+        if place_id and job_id:
+            existing_join = ("https://www.roblox.com/games/%s?gameId=%s"
+                             % (place_id, job_id))
+        elif place_id and link_code:
             existing_join = ("https://www.roblox.com/games/%s/?privateServerLinkCode=%s"
                              % (place_id, link_code))
         self.place_var = tk.StringVar(value=existing_join)
@@ -2201,8 +2258,9 @@ class ProfileDialog(BaseDialog):
                  text="Tip: get the cookie from your own browser's dev tools while\n"
                       "logged into roblox.com (Storage > Cookies > .ROBLOSECURITY).\n"
                       "Leave it blank for a guest login. Only use accounts you own.\n"
-                      "For the game, paste a place ID, a game URL, or a private\n"
-                      "server link - blank opens the Roblox app home page instead.",
+                      "For the game, paste a place ID, a game URL, a private\n"
+                      "server link, or a server link with a gameId - blank opens\n"
+                      "the Roblox app home page instead.",
                  bg=BG, fg=SUBTEXT, justify="left", font=("Segoe UI", 8)).grid(
             row=7, column=0, sticky="w", padx=12, pady=(4, 8)
         )
@@ -2227,7 +2285,7 @@ class ProfileDialog(BaseDialog):
                     return
             except Exception:
                 pass
-        place, link_code = parse_join_target(self.place_var.get())
+        place, link_code, job_id = parse_join_target(self.place_var.get())
         raw_join = self.place_var.get().strip()
         if raw_join and not place:
             try:
@@ -2245,7 +2303,7 @@ class ProfileDialog(BaseDialog):
         except Exception:
             cores = 0
         self.result = {"name": name, "cookie": cookie, "place_id": place or "",
-                       "link_code": link_code or "",
+                       "link_code": link_code or "", "job_id": job_id or "",
                        "auto_rejoin": bool(self.rejoin_var.get()),
                        "allow_guest_fallback": bool(self.guest_fallback_var.get()),
                        "cores": cores,
@@ -2320,6 +2378,7 @@ class MultiRobloxApp:
         self._last_ticket_at = 0.0
         self._hotkeys = None
         self._reported_failures = set()
+        self._failure_counts = {}
         self.layouts = load_layouts()
         self.pid_lock = threading.RLock()
 
@@ -3548,6 +3607,18 @@ class MultiRobloxApp:
                                 bool(prof.get("auto_rejoin")),
                                 bool(prof.get("allow_guest_fallback"))))
 
+            unknown = unknown_exits_path()
+            if os.path.exists(unknown):
+                try:
+                    size = os.path.getsize(unknown)
+                    lines.append("")
+                    lines.append("unrecognised client exits captured: %s (%d bytes)"
+                                 % (unknown, size))
+                    lines.append("  send that file if auto-rejoin is guessing "
+                                 "wrong - it holds the real log wording.")
+                except Exception:
+                    pass
+
             report = "\n".join(lines)
             path = os.path.join(config_dir(), "diagnostics.txt")
             try:
@@ -3947,6 +4018,17 @@ class MultiRobloxApp:
                     self._reported_failures.add(name)
                     self.log("The %s stopped working - details are in the log "
                              "file. Everything else carries on." % name)
+                # Two failures in a row means it is broken on this PC, not
+                # unlucky. Turn it off rather than throwing every few seconds.
+                self._failure_counts[name] = self._failure_counts.get(name, 0) + 1
+                if self._failure_counts[name] >= 2:
+                    setting = {"background priority": "background_priority",
+                               "audio focus": "mute_background"}.get(name)
+                    if setting and self.settings.get(setting):
+                        self.settings[setting] = False
+                        save_settings(self.settings)
+                        self.log("Turned '%s' off - it keeps failing on this PC. "
+                                 "You can switch it back on in Settings." % name)
         self._schedule_refresh()
 
     def _apply_background_priority(self):
@@ -4309,6 +4391,8 @@ class MultiRobloxApp:
                 suffix += "  ·  " + game
                 if p.get("link_code"):
                     suffix += " (private)"
+                elif p.get("job_id"):
+                    suffix += " (one server)"
             if int(p.get("cores") or 0) > 0:
                 suffix += "  ·  %d core%s" % (p["cores"],
                                               "" if p["cores"] == 1 else "s")
@@ -4449,6 +4533,8 @@ class MultiRobloxApp:
         bits = ["Place ID %s" % place_id]
         if profile.get("link_code"):
             bits.append("private server")
+        elif profile.get("job_id"):
+            bits.append("specific server %s..." % profile["job_id"][:8])
         self.game_detail_label.configure(text="  ·  ".join(bits))
 
         photo = self._photo_for(place_id)
@@ -4666,7 +4752,8 @@ class MultiRobloxApp:
                             existing.get("auto_rejoin", False),
                             existing.get("cores", 0),
                             existing.get("allow_guest_fallback", False),
-                            existing.get("monitor", 0))
+                            existing.get("monitor", 0),
+                            existing.get("job_id", ""))
         self.root.wait_window(dlg)
         if dlg.result:
             dlg.result["_cookie_ok"] = None
@@ -5062,6 +5149,7 @@ class MultiRobloxApp:
 
         place_id = (profile.get("place_id") or "").strip() or None
         link_code = (profile.get("link_code") or "").strip() or None
+        job_id = (profile.get("job_id") or "").strip() or None
 
         # Keep a gap between sign-in requests: firing several at once is what
         # triggers Roblox's rate limiter during Launch All.
@@ -5104,7 +5192,7 @@ class MultiRobloxApp:
             before = {p.pid for p in get_roblox_processes()}
             try:
                 cmd = build_launch_command(exe_path, ticket, method, place_id,
-                                           handler_exe, link_code)
+                                           handler_exe, link_code, job_id)
                 if not cmd:
                     continue
                 subprocess.Popen(cmd)

@@ -1,6 +1,6 @@
 @echo off
-REM Builds MultiRoblox.exe. Run from the folder holding multi_roblox.py.
-REM Requires Windows and Python 3.10+.
+REM Builds MultiRoblox.exe. Run this from the folder holding multi_roblox.py
+REM and MultiRoblox.ico. Requires Windows and Python 3.10+.
 
 echo Installing dependencies...
 python -m pip install --upgrade psutil requests cryptography pyinstaller pystray pillow pycaw
@@ -16,7 +16,14 @@ python -m PyInstaller --noconfirm --clean --onefile --windowed ^
 if errorlevel 1 goto failed
 
 echo.
-echo Done - dist\MultiRoblox.exe
+echo Done. The exe is dist\MultiRoblox.exe
+echo.
+echo SHA-256 (paste this into the GitHub release notes):
+certutil -hashfile dist\MultiRoblox.exe SHA256
+echo.
+echo NOTE: the exe is around 28 MB. GitHub's repo uploader rejects files over
+echo 25 MB - attach it to a RELEASE instead, which has no such limit.
+pause
 explorer dist
 goto end
 

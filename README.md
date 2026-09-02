@@ -35,7 +35,7 @@ Not affiliated with, endorsed by, or connected to Roblox Corporation.
 |---|---|
 | **Multi-instance** | Releases the single-instance lock so more clients can start. A watcher switch does it automatically for any client you open. |
 | **Accounts** | Save a profile per account. Cookies are encrypted at rest with a master password (PBKDF2-SHA256, 390k iterations, Fernet). |
-| **Per-profile games** | A place ID, a game URL, or a private server link. Each account goes where you send it. |
+| **Per-profile games** | A place ID, a game URL, a private server link, or a link to one specific server. Each account goes where you send it. |
 | **Auto-rejoin** | Relaunches a client that closed. Reads Roblox's own log first: it rejoins after a crash or a dropped connection, but not after a kick, an idle-kick or a moderation action. |
 | **CPU** | Core limits (global or per profile), spread across cores, and below-normal priority for clients you aren't looking at. |
 | **Frame rate** | Caps FPS via Roblox's own `ClientAppSettings.json`. 30 fps saves a lot with several clients open. |
@@ -79,7 +79,8 @@ pyinstaller --noconfirm --clean --onefile --windowed --icon MultiRoblox.ico ^
   --name MultiRoblox multi_roblox.py
 ```
 
-The result is `dist\MultiRoblox.exe`. Or just run the script directly:
+The result is `dist\MultiRoblox.exe` (about 28 MB). Or just run the script
+directly:
 
 ```bat
 python multi_roblox.py
@@ -149,6 +150,10 @@ Everything is on your own machine, in `%AppData%\MultiRobloxGUI`:
 Nothing is sent anywhere except Roblox's own API (to sign in and to look up
 game names) and, if you turn alerts on, the ntfy or Discord endpoint you
 configured.
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
