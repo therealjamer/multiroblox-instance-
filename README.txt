@@ -1,4 +1,4 @@
-MultiRoblox 3.1 - run several Roblox clients at once
+MultiRoblox - run several Roblox clients at once
 ====================================================
 
 WHAT IT DOES
@@ -93,6 +93,18 @@ FRAME RATE
   client on the PC (including the one you are playing), and Roblox clears it
   when it updates - MultiRoblox re-applies it at each launch.
   If you use Bloxstrap, it has its own FPS setting; use one or the other.
+
+
+CPU LIMITS - TWO DIFFERENT THINGS
+  Core limit (affinity) decides WHICH cores a client may use. A client limited
+  to two cores can still run both of them at 100%.
+  Settings -> "Hard-cap CPU per instance" decides HOW MUCH it may actually
+  use, as a percentage of one core, enforced by Windows itself. 0 = off.
+  Use affinity to keep clients out of each other's way; use the hard cap when
+  you want a guaranteed ceiling for background accounts.
+
+  Core spreading now steps whole physical cores, so two instances do not land
+  on two hyperthread siblings of the same physical core.
 
 
 SOUND, HOTKEYS AND MONITORS

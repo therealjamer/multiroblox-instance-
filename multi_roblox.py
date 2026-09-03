@@ -364,6 +364,7 @@ DEFAULT_SETTINGS = {
     "cores": min(2, os.cpu_count() or 1),
     "auto_apply_cores": True,
     "spread_affinity": True,
+    "cpu_percent_limit": 0,
     "watch_interval": 2.0,
     "watcher_one_shot": False,
     "watcher_autostart": False,
@@ -619,6 +620,18 @@ if IS_WINDOWS:
     kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, BOOL, ctypes.c_wchar_p]
     kernel32.CreateMutexW.restype = HANDLE
 
+    # Job objects: how the hard CPU-rate cap is enforced (see
+    # apply_cpu_rate_cap below). Unlike everything else in this block, these
+    # touch a process only after the user has explicitly turned the cap on.
+    kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
+    kernel32.CreateJobObjectW.restype = HANDLE
+    kernel32.SetInformationJobObject.argtypes = [
+        HANDLE, ctypes.c_int, ctypes.c_void_p, DWORD
+    ]
+    kernel32.SetInformationJobObject.restype = BOOL
+    kernel32.AssignProcessToJobObject.argtypes = [HANDLE, HANDLE]
+    kernel32.AssignProcessToJobObject.restype = BOOL
+
     ntdll.NtQuerySystemInformation.argtypes = [
         ULONG, ctypes.c_void_p, ULONG, ctypes.POINTER(ULONG)
     ]
@@ -659,9 +672,22 @@ SystemExtendedHandleInformation = 64
 STATUS_INFO_LENGTH_MISMATCH = 0xC0000004
 PROCESS_DUP_HANDLE = 0x0040
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+PROCESS_TERMINATE = 0x0001
+PROCESS_SET_QUOTA = 0x0100
 ObjectNameInformation = 1
 ObjectTypeInformation = 2
 DUPLICATE_CLOSE_SOURCE = 0x0001
+
+# --- CPU rate cap (Job Objects) ---------------------------------------
+JobObjectCpuRateControlInformation = 15
+JOB_OBJECT_CPU_RATE_CONTROL_ENABLE = 0x00000001
+JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP = 0x00000004
+
+
+class JOBOBJECT_CPU_RATE_CONTROL_INFORMATION(ctypes.Structure):
+    """CpuRate is hundredths of a percent (10000 = 100%) of the WHOLE
+    machine's combined capacity, not of one core - see cpu_rate_value()."""
+    _fields_ = [("ControlFlags", DWORD), ("CpuRate", DWORD)]
 # Handles with exactly this access mask can be synchronous named pipes;
 # asking the kernel for their name can block forever. Only relevant on
 # the fallback path (the fast path filters by object type first).
@@ -951,6 +977,70 @@ def unlock_with_retry(pid, attempts, delay, log, stop_event=None):
     return False
 
 
+def cpu_rate_value(percent_of_core, total_cores):
+    """Converts 'X% of ONE core' - the number shown in the UI - into what
+    SetInformationJobObject actually wants: hundredths of a percent of the
+    WHOLE machine's combined capacity (10000 = every core at 100%)."""
+    total_cores = max(1, int(total_cores))
+    percent_of_core = max(1, min(100, int(percent_of_core)))
+    value = int(round(percent_of_core * 10000 / (100 * total_cores)))
+    return max(1, min(10000, value))
+
+
+def apply_cpu_rate_cap(pid, percent_of_core, log=print):
+    """Hard-caps a process's CPU usage with a Windows Job Object.
+
+    This is a stronger limit than CPU affinity: affinity only says WHICH
+    cores a process may run on, so a client 'limited' to 2 cores can still
+    peg both of them at 100%. A job object's CPU-rate control caps HOW MUCH
+    of them it may use, enforced by the Windows scheduler itself, so it
+    applies on top of (not instead of) whatever affinity is already set.
+
+    percent_of_core is relative to a single core - 50 means 'never more than
+    half of one core's worth', whatever affinity the process has.
+    Returns True only if the cap was actually applied.
+    """
+    if not IS_WINDOWS:
+        return False
+    hprocess = kernel32.OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, False, pid)
+    if not hprocess:
+        err = kernel32.GetLastError()
+        log("Could not open PID %d to cap its CPU usage (error %d)%s."
+            % (pid, err, " - try running as Administrator" if err == 5 else ""))
+        return False
+    hjob = None
+    try:
+        hjob = kernel32.CreateJobObjectW(None, None)
+        if not hjob:
+            log("Could not create a job object to cap PID %d's CPU usage "
+                "(error %d)." % (pid, kernel32.GetLastError()))
+            return False
+        info = JOBOBJECT_CPU_RATE_CONTROL_INFORMATION()
+        info.ControlFlags = (JOB_OBJECT_CPU_RATE_CONTROL_ENABLE
+                             | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP)
+        info.CpuRate = cpu_rate_value(percent_of_core, os.cpu_count() or 1)
+        if not kernel32.SetInformationJobObject(
+                hjob, JobObjectCpuRateControlInformation,
+                ctypes.byref(info), ctypes.sizeof(info)):
+            log("Could not set the CPU cap for PID %d (error %d)."
+                % (pid, kernel32.GetLastError()))
+            return False
+        if not kernel32.AssignProcessToJobObject(hjob, hprocess):
+            err = kernel32.GetLastError()
+            log("Could not apply the CPU cap to PID %d (error %d)%s."
+                % (pid, err,
+                   " - it may already belong to another job" if err == 5 else ""))
+            return False
+        return True
+    finally:
+        # The cap stays in effect for the rest of the process's life once
+        # assigned - AssignProcessToJobObject keeps its own reference to
+        # both. Closing these handles here only stops us leaking them.
+        if hjob:
+            kernel32.CloseHandle(HANDLE(hjob))
+        kernel32.CloseHandle(HANDLE(hprocess))
+
+
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 RUN_VALUE = "MultiRoblox"
 
@@ -1207,6 +1297,25 @@ def apply_fps_cap(cap):
                       else "frame-rate cap removed")
     except Exception as ex:
         return False, "%s: %s" % (type(ex).__name__, ex)
+
+
+def fps_cap_matches(cap):
+    """Cheap read-only check: does the on-disk ClientAppSettings.json already
+    hold the frame-rate cap this session wants? Lets the caller avoid
+    rewriting the file every few seconds just to confirm nothing changed."""
+    path = client_settings_path()
+    if not path:
+        return True  # nothing we could do about it either way
+    want = None if not cap or str(cap).lower() in ("off", "0") else int(cap)
+    try:
+        if not os.path.exists(path):
+            return want is None
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        have = data.get("DFIntTaskSchedulerTargetFps") if isinstance(data, dict) else None
+        return have == want
+    except Exception:
+        return False  # unreadable/corrupt - treat as drifted so it gets fixed
 
 
 def detect_launch_handler():
@@ -2394,6 +2503,8 @@ class MultiRobloxApp:
         self._window_cache = {}
         self._affinity_cursor = 0
         self._refresh_job = None
+        self._settings_save_job = None
+        self._last_fps_check = 0.0
 
         self._build_ui()
 
@@ -2520,9 +2631,9 @@ class MultiRobloxApp:
         if self.busy or self.closing or time.time() < self._transient_until:
             return
         clients = list(self.pid_labels)
-        running = len(self.tree.get_children())
-        unlocked = len([p for p in self.unlocked_pids if str(p) in
-                        self.tree.get_children()])
+        tree_pids = set(self.tree.get_children())
+        running = len(tree_pids)
+        unlocked = len([p for p in self.unlocked_pids if str(p) in tree_pids])
         bad = len([p for p in self.profiles if p.get("_cookie_ok") is False])
         bits = ["%d client%s" % (running, "" if running == 1 else "s")]
         if unlocked:
@@ -3170,6 +3281,18 @@ class MultiRobloxApp:
         full(self._check(body, "Spread instances across different cores "
                                "(instead of pinning them all to cores 0..N)",
                          self.spread_var, self._on_setting_changed))
+        self.cpu_cap_var = tk.IntVar(
+            value=int(self.settings.get("cpu_percent_limit", 0) or 0))
+        labelled("Hard-cap CPU per instance (% of one core, 0 = off):",
+                 self._spin(body, self.cpu_cap_var, 0, 100, width=6),
+                 "enforced by Windows - affinity alone still lets a client "
+                 "peg the cores it has")
+        tk.Label(body, text="    Affinity (above/on the Instances tab) picks WHICH "
+                            "cores a client may use; this caps HOW MUCH of them "
+                            "it may actually use.",
+                 bg=PANEL, fg=SUBTEXT, font=("Segoe UI", 8), justify="left").grid(
+            row=row, column=0, columnspan=3, sticky="w")
+        row += 1
 
         # --- alerts ---
         section("Alerts")
@@ -3354,7 +3477,7 @@ class MultiRobloxApp:
                     self.unlock_delay_var, self.stagger_var, self.timeout_var,
                     self.rejoin_max_var, self.rejoin_cooldown_var,
                     self.rejoin_reset_var, self.ticket_gap_var,
-                    self.tile_monitor_var):
+                    self.tile_monitor_var, self.cpu_cap_var):
             var.trace_add("write", lambda *_: self._on_setting_changed())
 
         self.root.after(120, _resize_scrollregion)
@@ -3391,6 +3514,7 @@ class MultiRobloxApp:
             self.settings["cores"] = int(self.cores_var.get())
             self.settings["auto_apply_cores"] = bool(self.auto_limit_var.get())
             self.settings["spread_affinity"] = bool(self.spread_var.get())
+            self.settings["cpu_percent_limit"] = max(0, int(self.cpu_cap_var.get()))
             self.settings["watch_interval"] = float(self.interval_var.get())
             self.settings["watcher_one_shot"] = bool(self.one_shot_var.get())
             self.settings["watcher_autostart"] = bool(self.autostart_var.get())
@@ -3421,9 +3545,25 @@ class MultiRobloxApp:
         except (ValueError, tk.TclError, AttributeError):
             # a spinbox mid-edit can be empty or partially typed - ignore
             return
-        save_settings(self.settings)
+        # Writing to disk does a full flush+fsync, which is expensive enough
+        # to make typing feel laggy when it runs on every keystroke (e.g. the
+        # notify-target Entry). Coalesce a burst of changes into one write a
+        # moment after the user stops - on_close() still flushes immediately
+        # if they close the window before the delay is up.
+        if self._settings_save_job:
+            try:
+                self.root.after_cancel(self._settings_save_job)
+            except Exception:
+                pass
+        self._settings_save_job = self.root.after(400, self._flush_settings)
         if self.watcher_running:
             self._update_switch_labels()
+
+    def _flush_settings(self):
+        self._settings_save_job = None
+        if self.closing:
+            return
+        save_settings(self.settings)
 
     def _on_fps_changed(self, *_args):
         self._on_setting_changed()
@@ -4004,11 +4144,20 @@ class MultiRobloxApp:
         self._refresh_job = self.root.after(3000, self._periodic_refresh)
 
     def _periodic_refresh(self):
+        # One process/foreground-window snapshot, shared by every step below,
+        # instead of each step scanning the whole system process table on its
+        # own - that was three full scans a tick for one round of updates.
+        procs = get_roblox_processes()
+        front = foreground_pid()
+
         # Each step is isolated: one failing feature must not stop the others,
         # and none of them may stop the refresh loop rescheduling itself.
-        for name, step in (("instance list", self.refresh_instances),
-                           ("background priority", self._apply_background_priority),
-                           ("audio focus", self._apply_audio_focus),
+        for name, step in (("instance list", lambda: self.refresh_instances(procs)),
+                           ("background priority",
+                            lambda: self._apply_background_priority(procs, front)),
+                           ("audio focus",
+                            lambda: self._apply_audio_focus(procs, front)),
+                           ("frame-rate cap", lambda: self._reassert_fps_cap(procs)),
                            ("status summary", self._update_summary)):
             try:
                 step()
@@ -4031,7 +4180,7 @@ class MultiRobloxApp:
                                  "You can switch it back on in Settings." % name)
         self._schedule_refresh()
 
-    def _apply_background_priority(self):
+    def _apply_background_priority(self, procs=None, front=None):
         """Everything except the client you are actually looking at runs at
         below-normal priority. Windows then favours the window in front, which
         helps far more than core pinning when several clients are open."""
@@ -4041,8 +4190,9 @@ class MultiRobloxApp:
         normal = getattr(psutil, "NORMAL_PRIORITY_CLASS", None)
         if low is None or normal is None:
             return
-        front = foreground_pid()
-        for p in get_roblox_processes():
+        if front is None:
+            front = foreground_pid()
+        for p in (get_roblox_processes() if procs is None else procs):
             want = normal if p.pid == front else low
             if self._priority_state.get(p.pid) == want:
                 continue
@@ -4052,19 +4202,45 @@ class MultiRobloxApp:
             except Exception:
                 self._priority_state[p.pid] = want   # don't retry every tick
 
-    def _apply_audio_focus(self):
+    def _apply_audio_focus(self, procs=None, front=None):
         """Only the client you are looking at makes noise."""
         if AudioUtilities is None or not self.settings.get("mute_background"):
             return
-        pids = {p.pid for p in get_roblox_processes()}
+        pids = {p.pid for p in (get_roblox_processes() if procs is None else procs)}
         if not pids:
             return
-        front = foreground_pid()
+        if front is None:
+            front = foreground_pid()
         keep = {front} if front in pids else set()
         try:
             set_session_mute(pids - keep, keep)
         except Exception:
             pass
+
+    def _reassert_fps_cap(self, procs=None):
+        """Self-heals the frame-rate cap if something has undone it mid-
+        session - Roblox recreating the version folder on a self-update, a
+        bootstrapper writing its own ClientAppSettings.json, or a stray edit.
+        _ensure_fps_cap() already reapplies it before every launch; this
+        catches drift for clients that are already running.
+
+        Rate-limited to a read-only check every 20s, and only bothers when
+        the file has actually drifted, so this does not add disk I/O to
+        every 3-second tick."""
+        cap = self.settings.get("fps_cap", "off")
+        if cap in ("off", "0", "", None):
+            return
+        now = time.time()
+        if now - self._last_fps_check < 20:
+            return
+        self._last_fps_check = now
+        if not (get_roblox_processes() if procs is None else procs):
+            return  # nothing running - nothing to protect right now
+        if fps_cap_matches(cap):
+            return
+        ok, msg = apply_fps_cap(cap)
+        if ok:
+            self.log("Frame-rate cap had drifted - reapplied: %s" % msg)
 
     def _unmute_all(self):
         if AudioUtilities is None:
@@ -4087,14 +4263,14 @@ class MultiRobloxApp:
                 pass
         self._priority_state.clear()
 
-    def refresh_instances(self):
+    def refresh_instances(self, procs=None):
         if self.closing:
             return
         windows = get_window_map()
         seen = set()
         total_cores = os.cpu_count() or 1
 
-        for p in get_roblox_processes():
+        for p in (get_roblox_processes() if procs is None else procs):
             pid = p.pid
             seen.add(pid)
             title = "(no window yet)"
@@ -4348,16 +4524,45 @@ class MultiRobloxApp:
             return
         self._close_pids(pids, "all %d running Roblox client(s)" % len(pids))
 
+    def _smt_ratio(self):
+        """Logical processors per physical core (1 if unknown or no SMT).
+
+        os.cpu_count() and the affinity mask both count LOGICAL processors,
+        so two hyperthread siblings look like 'different cores' but actually
+        share one physical core's real execution resources. Spreading across
+        logical IDs alone can quietly put two instances on the same physical
+        core anyway - this lets _next_affinity spread across physical cores
+        instead. Windows numbers siblings contiguously by convention; there
+        is no portable way to ask for the real topology without extra native
+        calls, so this is the same assumption other spreading tools make."""
+        if psutil is None:
+            return 1
+        try:
+            physical = psutil.cpu_count(logical=False)
+            logical = psutil.cpu_count(logical=True)
+            if physical and logical and physical > 0:
+                return max(1, logical // physical)
+        except Exception:
+            pass
+        return 1
+
     def _next_affinity(self, cores):
         """Picks which cores this instance gets. With spreading on, each new
-        instance starts on a different core so two clients don't fight over
-        the same ones."""
+        instance starts on a different PHYSICAL core so two clients don't
+        fight over the same one - not just a different logical ID, which
+        could still be a hyperthread sibling of a core already in use."""
         total = os.cpu_count() or 1
         cores = max(1, min(int(cores), total))
         if not self.settings["spread_affinity"]:
             return list(range(cores))
+        ratio = self._smt_ratio()
         start = self._affinity_cursor % total
-        self._affinity_cursor = (start + cores) % total
+        # Round the step up to a whole physical core so the cursor stays
+        # aligned to physical-core boundaries - otherwise requesting an odd
+        # number of logical cores could leave the next instance starting
+        # mid-core, right back on a sibling of one already claimed.
+        step = ((cores + ratio - 1) // ratio) * ratio if ratio > 1 else cores
+        self._affinity_cursor = (start + step) % total
         return sorted({(start + i) % total for i in range(cores)})
 
     def _apply_core_limit(self, pid, cores):
@@ -4372,6 +4577,15 @@ class MultiRobloxApp:
                      % (pid, len(mask), ",".join(str(c) for c in mask)))
         except Exception as ex:
             self.log("Could not set CPU affinity for PID %d: %s" % (pid, ex))
+
+        # Affinity only says WHICH cores are allowed - it does not stop the
+        # client fully saturating them. The hard cap below is independent of
+        # it and only runs when the user has actually turned it on.
+        percent = int(self.settings.get("cpu_percent_limit", 0) or 0)
+        if percent > 0:
+            if apply_cpu_rate_cap(pid, percent, self.log):
+                self.log("Hard-capped PID %d to %d%% of one core."
+                         % (pid, percent))
 
     # ---------------- profiles ----------------
     def refresh_profile_list(self):
@@ -5249,6 +5463,11 @@ class MultiRobloxApp:
         if self._refresh_job:
             try:
                 self.root.after_cancel(self._refresh_job)
+            except Exception:
+                pass
+        if self._settings_save_job:
+            try:
+                self.root.after_cancel(self._settings_save_job)
             except Exception:
                 pass
         save_settings(self.settings)

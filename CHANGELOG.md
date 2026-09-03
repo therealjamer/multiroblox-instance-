@@ -1,5 +1,28 @@
 # Changelog
 
+## 3.2
+
+- **Hard CPU cap per instance.** CPU affinity only decides *which* cores a
+  client may use — it can still saturate every one of them. This adds a real
+  ceiling enforced by the Windows scheduler through a job object, expressed as
+  a percentage of one core, applied on top of whatever affinity is set.
+  Off by default; `0` means off.
+- **Core spreading is now SMT-aware.** Logical processor IDs are what the
+  affinity mask counts, so two "different cores" can be hyperthread siblings
+  sharing one physical core's execution resources. Spreading now steps whole
+  physical cores, so two instances no longer end up on the same one.
+- **The frame-rate cap heals itself.** It was applied before each launch, but
+  anything that rewrote `ClientAppSettings.json` mid-session — a Roblox
+  self-update recreating the version folder, a bootstrapper writing its own —
+  silently undid it for clients already running. A read-only check every 20
+  seconds now notices drift and reapplies it.
+- **Settings writes are coalesced.** Each change did a full flush and fsync,
+  which made typing into a settings field feel laggy. Writes are now batched a
+  moment after you stop, and flushed immediately on close.
+- **One process scan per refresh** instead of three. The instance list,
+  background priority and audio focus each walked the whole system process
+  table separately; they now share a single snapshot per tick.
+
 ## 3.1
 
 - **Join one specific server.** The game field now also accepts a link

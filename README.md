@@ -37,8 +37,8 @@ Not affiliated with, endorsed by, or connected to Roblox Corporation.
 | **Accounts** | Save a profile per account. Cookies are encrypted at rest with a master password (PBKDF2-SHA256, 390k iterations, Fernet). |
 | **Per-profile games** | A place ID, a game URL, a private server link, or a link to one specific server. Each account goes where you send it. |
 | **Auto-rejoin** | Relaunches a client that closed. Reads Roblox's own log first: it rejoins after a crash or a dropped connection, but not after a kick, an idle-kick or a moderation action. |
-| **CPU** | Core limits (global or per profile), spread across cores, and below-normal priority for clients you aren't looking at. |
-| **Frame rate** | Caps FPS via Roblox's own `ClientAppSettings.json`. 30 fps saves a lot with several clients open. |
+| **CPU** | Core limits (global or per profile), spread across *physical* cores rather than hyperthread siblings, below-normal priority for clients you aren't looking at, and an optional hard cap on how much CPU each client may actually use. |
+| **Frame rate** | Caps FPS via Roblox's own `ClientAppSettings.json`. 30 fps saves a lot with several clients open, and the cap is reapplied if anything overwrites it. |
 | **Windows** | Tile in a grid, columns or rows, across multiple monitors. Save each account's window position and have it restored on launch. |
 | **Audio** | Mutes every client except the one you're looking at. |
 | **Hotkeys** | `Ctrl+Alt+1..9` jumps to a client. |
@@ -90,6 +90,19 @@ python multi_roblox.py
 audio muting are unavailable and everything else works. `psutil`, `requests`
 and `cryptography` are required for the instance list, signed-in launches and
 the account saver respectively.
+
+### Affinity vs. the hard cap
+
+These are two different things and they work together:
+
+- **Core limit (affinity)** decides *which* cores a client is allowed on. A
+  client limited to two cores can still run both at 100%.
+- **Hard-cap CPU** (Settings, a percentage of one core) decides *how much* it
+  may actually use. Windows enforces it directly through a job object.
+
+Use affinity to keep clients out of each other's way, and the hard cap when
+you want a guaranteed ceiling — for example, keeping four background accounts
+from touching the headroom of whatever you are actually playing.
 
 ---
 
