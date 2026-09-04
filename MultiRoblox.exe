@@ -1,0 +1,13 @@
+blank_issues_enabled: true
+contact_links:
+  - name: My account got banned
+    url: https://github.com/YOURNAME/MultiRoblox#read-this-before-you-use-it
+    about: >
+      Multi-instancing and cookie sign-in are against Roblox's Terms of Use.
+      That risk is documented up front and there is nothing that can be done
+      about it here.
+  - name: Antivirus flagged the download
+    url: https://github.com/YOURNAME/MultiRoblox#install
+    about: >
+      Expected for an unsigned build that releases another process's lock
+      handle. Read the source or build it yourself.

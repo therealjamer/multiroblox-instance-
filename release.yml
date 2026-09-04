@@ -1,0 +1,40 @@
+---
+name: Bug report
+about: Something is broken
+labels: bug
+---
+
+**Before opening:** press **Diagnose** in the Settings tab and paste the report
+below. It contains no cookies and no webhook URLs, so it is safe to share — it
+answers most of what would otherwise be five rounds of questions.
+
+### What happened
+
+<!-- What you did, what you expected, what you got instead. -->
+
+### Diagnostics
+
+<details>
+<summary>Diagnose output</summary>
+
+```
+paste it here
+```
+
+</details>
+
+### Log
+
+<!-- Settings > Open Log File, and paste the last ~30 lines, especially any
+     block starting with "!! ERROR". -->
+
+```
+paste here
+```
+
+### Setup
+
+- MultiRoblox version (title bar):
+- Running the .exe or the .py:
+- Windows version:
+- Is Bloxstrap or another bootstrapper installed:

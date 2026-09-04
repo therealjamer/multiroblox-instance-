@@ -1,37 +1,78 @@
-@echo off
-REM Builds MultiRoblox.exe. Run this from the folder holding multi_roblox.py
-REM and MultiRoblox.ico. Requires Windows and Python 3.10+.
+name: Build and release
 
-echo Installing dependencies...
-python -m pip install --upgrade psutil requests cryptography pyinstaller pystray pillow pycaw
-if errorlevel 1 goto failed
+# Builds MultiRoblox.exe on GitHub's own Windows runner and attaches it to a
+# GitHub Release - not the repo itself. Releases have no file-size limit;
+# the repo's own "Add file" uploader is what capped you at 25MB.
+#
+# To ship a new version:
+#   1. Bump APP_VERSION in multi_roblox.py to match the tag you're about
+#      to push (e.g. APP_VERSION = "3.2" for tag v3.2). The build fails
+#      on purpose if these don't match - it's cheap insurance against
+#      shipping an exe that reports the wrong version.
+#   2. git tag v3.2 && git push origin v3.2
+#   3. Watch the Actions tab; the release appears automatically when it's
+#      done, with MultiRoblox.exe attached and its SHA-256 in the notes.
 
-echo.
-echo Building...
-python -m PyInstaller --noconfirm --clean --onefile --windowed ^
-  --icon MultiRoblox.ico ^
-  --collect-all cryptography --collect-all psutil --collect-all requests ^
-  --collect-all pystray --collect-all PIL --collect-all pycaw ^
-  --name MultiRoblox multi_roblox.py
-if errorlevel 1 goto failed
+on:
+  push:
+    tags:
+      - "v*"
 
-echo.
-echo Done. The exe is dist\MultiRoblox.exe
-echo.
-echo SHA-256 (paste this into the GitHub release notes):
-certutil -hashfile dist\MultiRoblox.exe SHA256
-echo.
-echo NOTE: the exe is around 28 MB. GitHub's repo uploader rejects files over
-echo 25 MB - attach it to a RELEASE instead, which has no such limit.
-pause
-explorer dist
-goto end
+permissions:
+  contents: write
 
-:failed
-echo.
-echo BUILD FAILED - the last error above says why.
-echo If the build folder vanished mid-build, that is antivirus: add an
-echo exclusion for this folder and try again.
-pause
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v4
 
-:end
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Confirm APP_VERSION matches the tag
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}" -replace '^v', ''
+          $match = Select-String -Path multi_roblox.py -Pattern '^APP_VERSION = "([^"]+)"'
+          if (-not $match) {
+            Write-Error "Could not find APP_VERSION in multi_roblox.py."
+            exit 1
+          }
+          $inFile = $match.Matches[0].Groups[1].Value
+          if ($inFile -ne $tag) {
+            Write-Error "Tag is v$tag but APP_VERSION in multi_roblox.py is `"$inFile`". Bump APP_VERSION to match before tagging, then re-push the tag."
+            exit 1
+          }
+          Write-Host "APP_VERSION ($inFile) matches tag ($tag) - continuing."
+
+      - name: Install dependencies
+        run: python -m pip install --upgrade -r requirements-dev.txt
+
+      - name: Build MultiRoblox.exe
+        run: >
+          python -m PyInstaller --noconfirm --clean --onefile --windowed
+          --icon MultiRoblox.ico
+          --collect-all cryptography --collect-all psutil --collect-all requests
+          --collect-all pystray --collect-all PIL --collect-all pycaw
+          --name MultiRoblox multi_roblox.py
+
+      - name: Write release notes (with SHA-256)
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash dist\MultiRoblox.exe -Algorithm SHA256).Hash
+          "SHA-256 of MultiRoblox.exe: $hash" | Out-File -FilePath release_notes.txt -Encoding utf8
+          "" | Out-File -FilePath release_notes.txt -Encoding utf8 -Append
+          "See CHANGELOG.md for what changed in this version." | Out-File -FilePath release_notes.txt -Encoding utf8 -Append
+
+      - name: Create GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: >
+          gh release create "${{ github.ref_name }}"
+          dist\MultiRoblox.exe
+          --title "MultiRoblox ${{ github.ref_name }}"
+          --notes-file release_notes.txt

@@ -1,0 +1,19 @@
+# Runtime dependencies for running multi_roblox.py directly with
+# `python multi_roblox.py`. Windows only.
+#
+#   pip install -r requirements.txt
+#
+# psutil, requests, and cryptography are required - the app still runs
+# without them, but with core limiting, signed-in launches, or the
+# encrypted account saver disabled respectively (it explains which, and
+# why, the first time you need one that's missing).
+psutil>=5.9
+requests>=2.31
+cryptography>=42.0
+
+# Optional: tray icon support (Settings > minimise to tray).
+pystray>=0.19
+pillow>=10.0
+
+# Optional: per-client mute (Settings > mute background clients).
+pycaw>=20230407
