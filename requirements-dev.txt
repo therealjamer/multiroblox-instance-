@@ -1,4 +1,5 @@
-# Only needed to build MultiRoblox.exe (see build.bat) - not required to
-# just run multi_roblox.py from source.
+# Only needed to build MultiRoblox.exe (see build.bat) or run the tests -
+# not required to just run multi_roblox.py from source.
 -r requirements.txt
 pyinstaller>=6.0
+pytest>=7.0
