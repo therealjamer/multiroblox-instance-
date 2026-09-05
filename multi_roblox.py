@@ -427,6 +427,7 @@ DEFAULT_SETTINGS = {
     "ui_scale": 1.0,
     "screenshot_enabled": False,
     "screenshot_interval_minutes": 10,
+    "refresh_interval_seconds": 3.0,
 }
 
 
@@ -3667,6 +3668,22 @@ class MultiRobloxApp:
 
         # --- window / performance ---
         section("Window and performance")
+        preset_row = tk.Frame(body, bg=PANEL)
+        preset_row.grid(row=row, column=0, columnspan=3, sticky="w", pady=(0, 6))
+        row += 1
+        self.make_button(preset_row, "Optimize for a Low-End PC",
+                         self._apply_low_end_preset, accent=AMBER).pack(side="left")
+        tk.Label(preset_row, text="   sets the options below to sensible values for "
+                                  "a weak CPU - you can still change any of them after",
+                 bg=PANEL, fg=SUBTEXT, font=(FONT_FAMILY, 8)).pack(side="left")
+
+        self.refresh_interval_var = tk.DoubleVar(
+            value=float(self.settings.get("refresh_interval_seconds", 3.0)))
+        labelled("Instance list refresh (seconds):",
+                 self._spin(body, self.refresh_interval_var, 1.0, 30.0,
+                           width=6, increment=0.5),
+                 "how often MultiRoblox itself re-scans - higher uses less CPU")
+
         self.fps_var = tk.StringVar(value=str(self.settings.get("fps_cap", "off")))
         fps_menu = tk.OptionMenu(body, self.fps_var, *FPS_CAP_CHOICES)
         try:
@@ -3802,7 +3819,7 @@ class MultiRobloxApp:
                     self.rejoin_max_var, self.rejoin_cooldown_var,
                     self.rejoin_reset_var, self.ticket_gap_var,
                     self.tile_monitor_var, self.cpu_cap_var, self.ui_scale_var,
-                    self.screenshot_interval_var):
+                    self.screenshot_interval_var, self.refresh_interval_var):
             var.trace_add("write", lambda *_: self._on_setting_changed())
 
         self.root.after(120, _resize_scrollregion)
@@ -3895,6 +3912,8 @@ class MultiRobloxApp:
             self.settings["screenshot_enabled"] = bool(self.screenshot_enabled_var.get())
             self.settings["screenshot_interval_minutes"] = max(
                 1, int(self.screenshot_interval_var.get()))
+            self.settings["refresh_interval_seconds"] = max(
+                1.0, float(self.refresh_interval_var.get()))
         except (ValueError, tk.TclError, AttributeError):
             # a spinbox mid-edit can be empty or partially typed - ignore
             return
@@ -3981,6 +4000,61 @@ class MultiRobloxApp:
             self.root.destroy()
         except Exception:
             pass
+
+    def _apply_low_end_preset(self):
+        """One-click bundle of the settings that actually matter on a weak
+        CPU, instead of having to know which six knobs to go find and tune
+        individually. Writes self.settings directly rather than only
+        setting the Tk variables - a BooleanVar's Checkbutton `command` only
+        fires on an actual click, not on a programmatic .set(), so relying
+        on that here would silently not persist half of these."""
+        if not messagebox.askyesno(
+                "Optimize for a low-end PC?",
+                "This changes several settings at once:\n\n"
+                "  - 1 core per instance\n"
+                "  - Hard-cap each instance to 50% of one core\n"
+                "  - Frame rate capped at 30\n"
+                "  - Background clients run at below-normal priority\n"
+                "  - Background clients muted\n"
+                "  - A bit more delay between launches\n"
+                "  - MultiRoblox's own refresh every 6 seconds instead of 3\n\n"
+                "You can change any of these again afterward. Continue?"):
+            return
+
+        stagger_target = max(5.0, float(self.settings.get("launch_stagger", 3.0)))
+
+        # Reflect the new values in the already-built Settings widgets first.
+        # Some of these fire _on_setting_changed() immediately (anything
+        # trace_add-bound), which re-derives EVERY setting from ALL its vars
+        # each time - so a var not yet updated when an earlier one fires
+        # gets re-read from its stale state in the meantime. Harmless: the
+        # explicit write below is authoritative and runs after all of these,
+        # but it's why stagger_target is a local computed once up front,
+        # never read back out of self.settings while this is in progress.
+        self.cores_var.set(1)
+        self.cpu_cap_var.set(50)
+        self.bg_priority_var.set(True)
+        self.mute_var.set(True)
+        self.spread_var.set(True)
+        self.refresh_interval_var.set(6.0)
+        self.stagger_var.set(stagger_target)
+        self.fps_var.set("30")   # also re-triggers _on_fps_changed via its
+                                 # trace, which writes Roblox's own FPS file
+
+        # Authoritative final write - correct regardless of how the partial
+        # syncs above landed in the meantime.
+        self.settings["cores"] = 1
+        self.settings["cpu_percent_limit"] = 50
+        self.settings["fps_cap"] = "30"
+        self.settings["background_priority"] = True
+        self.settings["mute_background"] = True
+        self.settings["spread_affinity"] = True
+        self.settings["refresh_interval_seconds"] = 6.0
+        self.settings["launch_stagger"] = stagger_target
+        save_settings(self.settings)
+
+        self.log("Applied the low-end PC preset. Cores/CPU-cap take effect on "
+                 "each account's next launch; the rest applies immediately.")
 
     def _on_hotkeys_changed(self, *_args):
         want = bool(self.hotkeys_var.get())
@@ -4543,7 +4617,9 @@ class MultiRobloxApp:
         watcher, so the table stays current."""
         if self.closing:
             return
-        self._refresh_job = self.root.after(3000, self._periodic_refresh)
+        interval_ms = max(1.0, float(
+            self.settings.get("refresh_interval_seconds", 3.0))) * 1000
+        self._refresh_job = self.root.after(int(interval_ms), self._periodic_refresh)
 
     def _periodic_refresh(self):
         # One process/foreground-window snapshot, shared by every step below,
