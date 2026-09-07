@@ -185,7 +185,7 @@ AMBER = "#d8a657"
 FONT_FAMILY = "Segoe UI"   # overwritten the same way, before any widget exists
 
 MAX_LOG_LINES = 800
-APP_VERSION = "3.4"
+APP_VERSION = "3.5"
 _LOG_FILE_LOCK = threading.Lock()
 MAX_LOG_FILE_BYTES = 1024 * 1024
 
@@ -5891,14 +5891,23 @@ class MultiRobloxApp:
     def _await_new_client(self, before, seconds):
         """Waits for a new Roblox client that is still alive a moment later,
         so a starter process that immediately hands off isn't mistaken for
-        either a success or a failure."""
+        either a success or a failure.
+
+        The settle time here matters more than it looks: Roblox's own
+        installer/updater can hand a URI-based launch off to a relaunch step
+        that fails a few seconds in (seen directly in Roblox's own log as
+        "Critical: failed to start client App"), well past a 2-second
+        check - which is exactly how a launch method that no longer works
+        got permanently misremembered as working. 5 seconds comfortably
+        clears that failure window without meaningfully slowing a real
+        launch down."""
         deadline = time.time() + max(3, int(seconds))
         while time.time() < deadline:
             time.sleep(0.5)
             candidates = {p.pid for p in get_roblox_processes()} - before
             if not candidates:
                 continue
-            time.sleep(2.0)
+            time.sleep(5.0)
             alive = sorted(p for p in candidates if process_alive(p))
             if alive:
                 return alive[-1]
@@ -5989,7 +5998,7 @@ class MultiRobloxApp:
             # different PID, so watching only the PID we spawned reported
             # perfectly good launches as failures. Accept ANY new client that
             # appears and is still alive a moment later.
-            found = self._await_new_client(before, seconds=18)
+            found = self._await_new_client(before, seconds=25)
             if found:
                 if preferred == "auto" and self.settings.get(
                         "launch_method_learned") != method:
@@ -6003,6 +6012,18 @@ class MultiRobloxApp:
                 return found
             self.log("Launch method '%s' (%s) left no client running."
                      % (method, LAUNCH_METHOD_LABELS[method]))
+            if method == learned:
+                # It was remembered as working, but just failed - Roblox
+                # changes what it accepts without notice (this exact
+                # scenario is what surfaced the bug: "uri" got learned once,
+                # then Roblox broke that launch style, and auto mode kept
+                # reusing it forever since nothing ever un-learned it).
+                # Forget it now so future launches try every method fresh
+                # instead of repeating a method that no longer works.
+                self.settings.pop("launch_method_learned", None)
+                save_settings(self.settings)
+                self.log("  '%s' was the remembered method but just failed - "
+                         "forgetting it, trying the others." % method)
 
         self.log("None of the signed-in launch methods kept a client open.")
         return None

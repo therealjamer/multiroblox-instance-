@@ -78,12 +78,15 @@ only the ones you picked, and never automatically.
 Download `MultiRoblox.exe` from [Releases](../../releases). Nothing else is
 needed — Python and every dependency are bundled.
 
-**It always asks Windows for administrator rights on launch.** That's
-deliberate — the unlock step needs it on some systems — but it does mean
-every Roblox client MultiRoblox launches also inherits admin rights, since
-child processes do by default. If you'd rather it stayed a normal user and
-only asked for elevation when it actually needed it, build it yourself
-without `--uac-admin` (see below).
+It runs as a normal user by default — if the unlock step needs Administrator
+on your system, use the "Restart as Administrator" option in Settings rather
+than forcing it every launch. (An earlier build tried forcing elevation via
+PyInstaller's `--uac-admin`; every Roblox client MultiRoblox launches
+inherits its parent's elevation, and Roblox's own updater/bootstrapper does
+not handle running elevated well — it failed outright with its own
+"Installer encountered a critical error" dialog and broke multi-instance
+launching. Don't add `--uac-admin` back without confirming it doesn't do
+that on your setup.)
 
 Windows SmartScreen will warn about it because it is unsigned. If you would
 rather not trust a binary from a stranger, build it yourself — it takes two
@@ -95,17 +98,15 @@ Requires Windows and Python 3.10+.
 
 ```bat
 pip install psutil requests cryptography pyinstaller pystray pillow pycaw
-pyinstaller --noconfirm --clean --onefile --windowed --uac-admin --icon MultiRoblox.ico ^
+pyinstaller --noconfirm --clean --onefile --windowed --icon MultiRoblox.ico ^
   --collect-all cryptography --collect-all psutil --collect-all requests ^
   --collect-all pystray --collect-all PIL --collect-all pycaw ^
   --name MultiRoblox multi_roblox.py
 ```
 
-Drop `--uac-admin` to build a normal-user version instead (see the note
-above about why the released build has it). The result is
-`dist\MultiRoblox.exe` (about 22 MB with UPX installed - see `build.bat` for
-the full script, which also UPX-compresses it). Or just run the script
-directly:
+The result is `dist\MultiRoblox.exe` (about 22 MB with UPX installed - see
+`build.bat` for the full script, which also UPX-compresses it). Or just run
+the script directly:
 
 ```bat
 python multi_roblox.py
@@ -154,7 +155,7 @@ cookies and no webhook URLs, so it is safe to paste into an issue.
 | `cookie rejected (HTTP 401)` | The cookie expired, or you logged out after copying it. Re-copy it in a private window. |
 | `Roblox is rate limiting` | Too many sign-ins at once. Wait a minute; raise **Gap between sign-ins**. Not a dead cookie. |
 | Client closes right after launching | Set a game on the profile. `launchmode:play` is far more reliable than the app home page. |
-| `Could not find the singleton lock` | The released build always runs elevated already; if you built your own without `--uac-admin`, try running as Administrator. |
+| `Could not find the singleton lock` | Try running as Administrator (Settings has a shortcut for this). Don't build with `--uac-admin` to force it permanently - see Install, above, for why. |
 | Nothing happens on launch | If you use Bloxstrap, check whether its own multi-instance option is also on. Use one or the other, not both. |
 | Sign-in fails and nothing launches | Deliberate. A guest launch would open whichever account Roblox already has, not the one you picked. There's a per-profile opt-in if you want that. |
 

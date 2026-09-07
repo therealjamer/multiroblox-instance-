@@ -8,7 +8,7 @@ if errorlevel 1 goto failed
 
 echo.
 echo Building...
-python -m PyInstaller --noconfirm --clean --onefile --windowed --uac-admin ^
+python -m PyInstaller --noconfirm --clean --onefile --windowed ^
   --icon MultiRoblox.ico ^
   --collect-all cryptography --collect-all psutil --collect-all requests ^
   --collect-all pystray --collect-all PIL --collect-all pycaw ^
@@ -24,11 +24,13 @@ echo.
 echo NOTE: the exe is around 28 MB. GitHub's repo uploader rejects files over
 echo 25 MB - attach it to a RELEASE instead, which has no such limit.
 echo.
-echo NOTE: --uac-admin means Windows shows a UAC prompt on EVERY launch and
-echo the app always runs elevated - which also means every Roblox client it
-echo launches inherits admin rights, since child processes do by default.
-echo Remove --uac-admin above if you'd rather it stayed a normal user and
-echo only offered elevation when the unlock step actually needed it.
+echo NOTE: this build does NOT force admin (asInvoker). It was briefly built
+echo with --uac-admin, but that made every launched Roblox client inherit
+echo admin rights too, and Roblox's own updater/bootstrapper does not
+echo handle running elevated well - it failed with its own "Installer
+echo encountered a critical error" dialog and broke multi-instance
+echo launching entirely. Add --uac-admin back only if you specifically need
+echo forced elevation and have confirmed it doesn't break your setup.
 pause
 explorer dist
 goto end

@@ -1,17 +1,39 @@
 # Changelog
 
+## 3.5
+
+- **Fixed: a signed-in launch method that stopped working could get stuck
+  as "the one that works," forever.** `auto` mode remembers whichever
+  method (`handler`/`uri`/`legacy`/`redeem`) last succeeded, so it doesn't
+  re-test all four every launch - but the check deciding "did this actually
+  work" only waited 2 seconds, and a real failure (Roblox's own installer/
+  relaunch hand-off failing, seen directly in Roblox's own log as "Critical:
+  failed to start client App") can land a couple of seconds past that. Once
+  a method got remembered this way, `auto` kept reusing it forever and
+  never re-tried the others - looking exactly like "it only launches one
+  instance now," even on machines that don't use Bloxstrap. Fixed two ways:
+  the check now waits 5 seconds, and a remembered method that fails gets
+  forgotten immediately instead of staying stuck.
+
 ## 3.4
 
-- **The released build always runs elevated.** Windows now shows a UAC
-  prompt on every launch. This also means every Roblox client MultiRoblox
-  starts inherits admin rights, since child processes do by default - build
-  it yourself without `--uac-admin` (see `build.bat`) if you'd rather it
-  stayed a normal user and only asked for elevation when unlock needed it.
 - **A test suite**, run automatically on every push via GitHub Actions
   (separate from the release build, which only runs on a version tag).
   Covers the update-checker's version comparison, game-link parsing, cookie
   cleanup, the CPU-rate math, the SMT-aware core-spreading stride, and the
   profile search/filter's index mapping.
+- **"Optimize for a Low-End PC" preset** in Settings, plus a configurable
+  refresh interval for MultiRoblox's own instance-list polling (was a fixed
+  3 seconds) - useful on a weaker CPU where that overhead is proportionally
+  bigger.
+- **Tried, then reverted: building with `--uac-admin`** (forced elevation on
+  every launch). Every Roblox client MultiRoblox starts inherits its
+  parent's elevation, and Roblox's own updater/bootstrapper does not handle
+  running elevated well - it failed outright with its own "Installer
+  encountered a critical error" dialog, breaking multi-instance launching
+  entirely. The release build is back to running as a normal user; use the
+  existing "Restart as Administrator" option in Settings if the unlock step
+  specifically needs it on your system.
 
 ## 3.2
 
