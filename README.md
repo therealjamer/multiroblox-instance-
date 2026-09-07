@@ -48,6 +48,10 @@ Not affiliated with, endorsed by, or connected to Roblox Corporation.
 | **Accounts** | Save a profile per account. Cookies are encrypted at rest with a master password (PBKDF2-SHA256, 390k iterations, Fernet). |
 | **Per-profile games** | A place ID, a game URL, a private server link, or a link to one specific server. Each account goes where you send it. |
 | **Auto-rejoin** | Relaunches a client that closed. Reads Roblox's own log first: it rejoins after a crash or a dropped connection, but not after a kick, an idle-kick or a moderation action. |
+| **Hang detection** | Optional. Restarts a client Windows itself reports as unresponsive (the same signal behind Task Manager's "Not Responding"), after being stuck that way for a configurable number of seconds. |
+| **Bulk import** | Paste several accounts at once as `Name,Cookie` lines instead of adding them one by one; can tag the whole batch with a group in the same step. |
+| **Groups** | Tag profiles (e.g. "Farming", "Alts") and filter the account list down to one group at a time. |
+| **Scheduler** | A dedicated tab: launch a saved profile at a chosen time of day, optionally only on certain days of the week, without Windows Task Scheduler. Only runs while MultiRoblox is open. |
 | **CPU** | Core limits (global or per profile), spread across *physical* cores (not just hyperthread siblings), plus a hard usage cap via a Windows Job Object on top of affinity, and below-normal priority for clients you aren't looking at. |
 | **Frame rate** | Caps FPS via Roblox's own `ClientAppSettings.json`, and re-applies it automatically if something else undoes it mid-session. 30 fps saves a lot with several clients open. |
 | **Windows** | Tile in a grid, columns or rows, across multiple monitors. Save each account's window position and have it restored on launch. |
@@ -57,7 +61,7 @@ Not affiliated with, endorsed by, or connected to Roblox Corporation.
 | **Search** | Filter the account list once you've got more than a handful saved. |
 | **Command line** | `--launch-all`, `--launch "Name"`, `--minimized` for a desktop shortcut or Task Scheduler. |
 | **Appearance** | Accent color, font, and UI scale, all changeable in Settings. |
-| **Updates** | Checks GitHub Releases on startup and shows a banner if a newer version is out. |
+| **Updates** | Checks GitHub Releases on startup and shows a banner if a newer version is out, with a "Download & Verify" option that downloads the new exe and checks it against the published SHA-256 - it doesn't replace the running exe or launch anything itself, just hands you a verified file. |
 | **History** | Every session — account, duration, how it ended — as a CSV. |
 | **Diagnostics** | One button writes a full report for troubleshooting. Contains no cookies. |
 

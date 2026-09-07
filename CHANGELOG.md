@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased
+
+- **Frozen/hung instance detection.** Off by default. Uses the same signal
+  Task Manager uses for "Not Responding" - if a launched client stops
+  responding for a configurable number of seconds, it's restarted (the
+  existing rejoin machinery takes it from there).
+- **Bulk profile import.** Paste several accounts at once as `Name,Cookie`
+  lines (the name is optional) instead of adding them one by one. Warns
+  about short/malformed cookies in a single summary rather than one dialog
+  per line, and can tag the whole batch with a group in one go.
+- **Profile groups/tags.** Give a profile an optional group (e.g. "Farming",
+  "Alts") and filter the account list down to just that group with a
+  dropdown next to the existing text search - the two filters combine.
+- **In-app scheduler**, a new tab. Launch a saved profile at a chosen time
+  of day, optionally only on certain days of the week, without needing
+  Windows Task Scheduler. Only runs while MultiRoblox is open.
+- **A better updater.** The update banner now has a second option,
+  "Download & Verify", alongside the existing link to the release page.
+  It downloads the new build in the background, checks it against the
+  SHA-256 that the release workflow publishes in the release notes, and
+  deletes it automatically if the hash doesn't match. Deliberately does
+  NOT replace the running exe or launch anything itself - antivirus gets
+  a normal downloaded file to scan rather than a process replacing
+  itself, and a bad download can't take out a working install. The
+  verified file is revealed in Explorer when it's done; run it yourself
+  whenever you're ready.
+
 ## 3.5
 
 - **Fixed: a signed-in launch method that stopped working could get stuck

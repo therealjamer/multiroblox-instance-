@@ -72,6 +72,7 @@ import base64
 import ctypes
 import traceback
 import glob
+import hashlib
 import io
 import json
 import os
@@ -428,6 +429,9 @@ DEFAULT_SETTINGS = {
     "screenshot_enabled": False,
     "screenshot_interval_minutes": 10,
     "refresh_interval_seconds": 3.0,
+    "hang_detection_enabled": False,
+    "hang_kill_after_seconds": 30,
+    "scheduled_launches": [],
 }
 
 
@@ -731,6 +735,13 @@ if IS_WINDOWS:
     user32.RegisterHotKey.restype = BOOL
     user32.UnregisterHotKey.argtypes = [ctypes.c_void_p, ctypes.c_int]
     user32.UnregisterHotKey.restype = BOOL
+
+    # Same call Task Manager uses to decide whether to show "(Not
+    # Responding)" - the OS already tracks whether a window's message loop
+    # is keeping up, so there's no need to reimplement that with a manual
+    # SendMessageTimeout.
+    user32.IsHungAppWindow.argtypes = [ctypes.c_void_p]
+    user32.IsHungAppWindow.restype = BOOL
 
     # Window screenshotting (periodic screenshot-to-webhook feature). Uses
     # PrintWindow with PW_RENDERFULLCONTENT, not a screen-region grab - a
@@ -1634,11 +1645,14 @@ def _version_tuple(v):
     return tuple(parts) or (0,)
 
 
-def check_for_update(timeout=8):
-    """Checks GitHub Releases for a version newer than APP_VERSION.
-    Returns (latest_version, release_url) if a newer one exists, or None -
-    including on any failure (no GITHUB_REPO set, no internet, rate
-    limited, etc). Safe to call from a background thread; makes exactly
+def fetch_latest_release(timeout=8):
+    """Fetches GitHub's latest release info. Returns a dict with
+    "version", "html_url", "download_url" (the MultiRoblox.exe asset, or
+    None if the release has no such asset) and "sha256" (parsed out of
+    the release notes body that release.yml writes, or None if it isn't
+    there) - or None entirely on any failure: no GITHUB_REPO set,
+    'requests' unavailable, no internet, rate limited, no release
+    published yet. Safe to call from a background thread; makes exactly
     one network request."""
     if not GITHUB_REPO or requests is None:
         return None
@@ -1650,12 +1664,90 @@ def check_for_update(timeout=8):
             return None
         data = r.json()
         tag = data.get("tag_name") or ""
-        url = data.get("html_url") or ("https://github.com/%s/releases" % GITHUB_REPO)
-        if tag and _version_tuple(tag) > _version_tuple(APP_VERSION):
-            return tag.lstrip("vV"), url
+        if not tag:
+            return None
+        html_url = data.get("html_url") or ("https://github.com/%s/releases" % GITHUB_REPO)
+        download_url = None
+        for asset in data.get("assets") or []:
+            if (asset.get("name") or "").lower() == "multiroblox.exe":
+                download_url = asset.get("browser_download_url")
+                break
+        sha256 = None
+        m = re.search(r"SHA-256[^:]*:\s*([0-9a-fA-F]{64})", data.get("body") or "")
+        if m:
+            sha256 = m.group(1).lower()
+        return {"version": tag.lstrip("vV"), "html_url": html_url,
+               "download_url": download_url, "sha256": sha256}
     except Exception:
-        pass
+        return None
+
+
+def check_for_update(timeout=8):
+    """Returns (latest_version, release_url) if a newer version than
+    APP_VERSION is published, else None. Thin wrapper around
+    fetch_latest_release() for the startup banner check."""
+    info = fetch_latest_release(timeout)
+    if info and _version_tuple(info["version"]) > _version_tuple(APP_VERSION):
+        return info["version"], info["html_url"]
     return None
+
+
+def download_verified_update(dest_dir, progress_cb=None, timeout=30):
+    """Downloads the latest release's MultiRoblox.exe into dest_dir and
+    checks it against the SHA-256 published in the release notes.
+    Returns (path, error): path is the downloaded, verified file on
+    success and None on any failure, with error explaining why. Deletes
+    the file itself if the hash doesn't match rather than leaving an
+    unverified exe on disk. Never touches the currently running exe and
+    never launches anything - deliberately not a silent self-replace, so
+    a bad download can't take out a working install and antivirus has
+    a normal file to scan rather than a process replacing itself.
+    progress_cb(bytes_done, bytes_total), if given, is called from
+    whatever thread this runs on - marshal to the UI thread yourself."""
+    if requests is None:
+        return None, "the 'requests' package is not installed"
+    info = fetch_latest_release(timeout)
+    if not info:
+        return None, "could not reach GitHub, or no release is published"
+    if _version_tuple(info["version"]) <= _version_tuple(APP_VERSION):
+        return None, "you already have the latest version"
+    if not info["download_url"]:
+        return None, "the latest release has no MultiRoblox.exe attached"
+    if not info["sha256"]:
+        return None, "the latest release notes don't list a SHA-256 to verify against"
+    try:
+        r = requests.get(info["download_url"], stream=True, timeout=timeout)
+        if not r.ok:
+            return None, "download failed (HTTP %d)" % r.status_code
+        total = int(r.headers.get("content-length") or 0)
+        dest_path = os.path.join(dest_dir, "MultiRoblox-%s.exe" % info["version"])
+        hasher = hashlib.sha256()
+        done = 0
+        with open(dest_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=262144):
+                if not chunk:
+                    continue
+                f.write(chunk)
+                hasher.update(chunk)
+                done += len(chunk)
+                if progress_cb:
+                    try:
+                        progress_cb(done, total)
+                    except Exception:
+                        pass
+        actual = hasher.hexdigest().lower()
+        if actual != info["sha256"]:
+            try:
+                os.remove(dest_path)
+            except Exception:
+                pass
+            return None, ("downloaded file's SHA-256 didn't match the published "
+                          "one (got %s..., expected %s...) - deleted it, don't "
+                          "run a copy from anywhere else either"
+                          % (actual[:12], info["sha256"][:12]))
+        return dest_path, None
+    except Exception as ex:
+        return None, str(ex)
 
 
 def set_session_mute(pids_to_mute, pids_to_unmute):
@@ -2212,6 +2304,21 @@ def close_window(hwnd):
         return False
 
 
+def is_window_hung(hwnd):
+    """True if Windows itself considers this window unresponsive - the
+    exact same check Task Manager uses for '(Not Responding)'. A hung
+    window won't reliably act on close_window()'s WM_CLOSE either, since
+    it isn't processing messages - that's the whole point of it being
+    hung, which is why restarting one needs a hard kill, not a close
+    request."""
+    if not IS_WINDOWS or not hwnd:
+        return False
+    try:
+        return bool(user32.IsHungAppWindow(hwnd))
+    except Exception:
+        return False
+
+
 def bring_window_to_front(hwnd):
     if not IS_WINDOWS or not hwnd:
         return
@@ -2526,7 +2633,7 @@ def authenticate(root):
 class ProfileDialog(BaseDialog):
     def __init__(self, master, name="", cookie="", place_id="", link_code="",
                  auto_rejoin=False, cores=0, allow_guest_fallback=False,
-                 monitor=0, job_id=""):
+                 monitor=0, job_id="", group=""):
         super().__init__(master, "Account Profile")
 
         tk.Label(self, text="Profile name:", bg=BG, fg=TEXT).grid(
@@ -2579,6 +2686,11 @@ class ProfileDialog(BaseDialog):
             side="left", padx=(6, 6))
         tk.Label(cores_row, text="0 = any", bg=BG, fg=SUBTEXT,
                  font=(FONT_FAMILY, 8)).pack(side="left")
+        tk.Label(cores_row, text="   Group:", bg=BG, fg=TEXT).pack(side="left")
+        self.group_var = tk.StringVar(value=group or "")
+        tk.Entry(cores_row, textvariable=self.group_var, width=10, bg=CONTROL,
+                 fg=TEXT, insertbackground=TEXT, relief="flat").pack(
+            side="left", padx=(6, 0))
 
         self.guest_fallback_var = tk.BooleanVar(value=bool(allow_guest_fallback))
         tk.Checkbutton(self, text="If sign-in fails, fall back to a guest launch "
@@ -2651,7 +2763,153 @@ class ProfileDialog(BaseDialog):
                        "auto_rejoin": bool(self.rejoin_var.get()),
                        "allow_guest_fallback": bool(self.guest_fallback_var.get()),
                        "cores": cores,
-                       "monitor": max(0, int(self.monitor_var.get() or 0))}
+                       "monitor": max(0, int(self.monitor_var.get() or 0)),
+                       "group": self.group_var.get().strip()}
+        self.destroy()
+
+
+# ---------------------------------------------------------------------
+# Bulk import dialog
+# ---------------------------------------------------------------------
+class BulkImportDialog(BaseDialog):
+    """Paste several accounts at once instead of adding them one by one."""
+    def __init__(self, master):
+        super().__init__(master, "Bulk Import Profiles")
+
+        tk.Label(self, text="One account per line: Name,Cookie", bg=BG,
+                 fg=TEXT).grid(row=0, column=0, sticky="w", padx=12, pady=(12, 0))
+        tk.Label(self, text="The name and its comma are optional - a line with "
+                            "just a cookie is imported as \"Account 1\", \"Account 2\", ...",
+                 bg=BG, fg=SUBTEXT, justify="left", font=(FONT_FAMILY, 8)).grid(
+            row=1, column=0, sticky="w", padx=12, pady=(0, 6))
+
+        self.text = tk.Text(self, width=70, height=16, bg=CONTROL, fg=TEXT,
+                            insertbackground=TEXT, relief="flat")
+        self.text.grid(row=2, column=0, padx=12, pady=4)
+        self.text.focus_set()
+
+        group_row = tk.Frame(self, bg=BG)
+        group_row.grid(row=3, column=0, sticky="w", padx=12, pady=(2, 0))
+        tk.Label(group_row, text="Group for all of these (optional):", bg=BG,
+                 fg=TEXT).pack(side="left")
+        self.group_var = tk.StringVar(value="")
+        tk.Entry(group_row, textvariable=self.group_var, width=16, bg=CONTROL,
+                 fg=TEXT, insertbackground=TEXT, relief="flat").pack(
+            side="left", padx=(8, 0))
+        self.group = ""
+
+        self.error_label = tk.Label(self, text="", bg=BG, fg=RED, wraplength=460,
+                                    justify="left")
+        self.error_label.grid(row=4, column=0, sticky="w", padx=12, pady=(4, 0))
+
+        btn_frame = tk.Frame(self, bg=BG)
+        btn_frame.grid(row=5, column=0, sticky="e", padx=12, pady=(6, 12))
+        tk.Button(btn_frame, text="Import", command=self._save, bg=CONTROL, fg=TEXT,
+                  relief="flat", padx=10).pack(side="left", padx=4)
+        tk.Button(btn_frame, text="Cancel", command=self._cancel, bg=CONTROL, fg=TEXT,
+                  relief="flat", padx=10).pack(side="left")
+
+    def _save(self):
+        raw_lines = [ln for ln in self.text.get("1.0", "end").splitlines()
+                    if ln.strip()]
+        if not raw_lines:
+            self.error_label.configure(text="Paste at least one line first.")
+            return
+        entries = []
+        for i, line in enumerate(raw_lines, 1):
+            name, cookie = "", line
+            if "," in line:
+                name, cookie = line.split(",", 1)
+            name = name.strip() or ("Account %d" % i)
+            cookie = clean_cookie(cookie)
+            entries.append((name, cookie))
+        self.group = self.group_var.get().strip()
+        self.result = entries
+        self.destroy()
+
+
+# ---------------------------------------------------------------------
+# Scheduled launch dialog
+# ---------------------------------------------------------------------
+DAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+
+class ScheduleDialog(BaseDialog):
+    """Add/edit one entry: launch a given profile at a given time of day,
+    optionally only on chosen days of the week."""
+    def __init__(self, master, profile_names, profile="", hour=8, minute=0,
+                 days=None, enabled=True):
+        super().__init__(master, "Scheduled Launch")
+        days = days or []
+
+        tk.Label(self, text="Profile:", bg=BG, fg=TEXT).grid(
+            row=0, column=0, sticky="w", padx=12, pady=(12, 0))
+        self.profile_var = tk.StringVar(value=profile if profile in profile_names
+                                        else (profile_names[0] if profile_names else ""))
+        ttk.Combobox(self, textvariable=self.profile_var, values=profile_names,
+                    state="readonly", width=40).grid(
+            row=1, column=0, padx=12, pady=4, sticky="w")
+
+        time_row = tk.Frame(self, bg=BG)
+        time_row.grid(row=2, column=0, sticky="w", padx=12, pady=(10, 0))
+        tk.Label(time_row, text="Time:", bg=BG, fg=TEXT).pack(side="left")
+        self.hour_var = tk.IntVar(value=max(0, min(23, int(hour))))
+        tk.Spinbox(time_row, from_=0, to=23, width=3, format="%02.0f",
+                  textvariable=self.hour_var, bg=CONTROL, fg=TEXT, relief="flat",
+                  buttonbackground=CONTROL, insertbackground=TEXT).pack(
+            side="left", padx=(8, 2))
+        tk.Label(time_row, text=":", bg=BG, fg=TEXT).pack(side="left")
+        self.minute_var = tk.IntVar(value=max(0, min(59, int(minute))))
+        tk.Spinbox(time_row, from_=0, to=59, width=3, format="%02.0f",
+                  textvariable=self.minute_var, bg=CONTROL, fg=TEXT, relief="flat",
+                  buttonbackground=CONTROL, insertbackground=TEXT).pack(
+            side="left", padx=(2, 0))
+        tk.Label(time_row, text="  (this PC's local time)", bg=BG, fg=SUBTEXT,
+                 font=(FONT_FAMILY, 8)).pack(side="left")
+
+        tk.Label(self, text="Days (none checked = every day):", bg=BG,
+                 fg=TEXT).grid(row=3, column=0, sticky="w", padx=12, pady=(10, 0))
+        days_row = tk.Frame(self, bg=BG)
+        days_row.grid(row=4, column=0, sticky="w", padx=12, pady=(2, 0))
+        self.day_vars = []
+        for i, label in enumerate(DAY_NAMES):
+            v = tk.BooleanVar(value=i in days)
+            self.day_vars.append(v)
+            tk.Checkbutton(days_row, text=label, variable=v, bg=BG, fg=TEXT,
+                          selectcolor=CONTROL, activebackground=BG,
+                          activeforeground=TEXT, font=(FONT_FAMILY, 9),
+                          highlightthickness=0, bd=0).pack(side="left")
+
+        self.enabled_var = tk.BooleanVar(value=bool(enabled))
+        tk.Checkbutton(self, text="Enabled", variable=self.enabled_var, bg=BG,
+                      fg=TEXT, selectcolor=CONTROL, activebackground=BG,
+                      activeforeground=TEXT, font=(FONT_FAMILY, 9), anchor="w",
+                      highlightthickness=0, bd=0).grid(
+            row=5, column=0, sticky="w", padx=10, pady=(8, 0))
+
+        self.error_label = tk.Label(self, text="", bg=BG, fg=RED, wraplength=380,
+                                    justify="left")
+        self.error_label.grid(row=6, column=0, sticky="w", padx=12)
+
+        btn_frame = tk.Frame(self, bg=BG)
+        btn_frame.grid(row=7, column=0, sticky="e", padx=12, pady=(8, 12))
+        tk.Button(btn_frame, text="Save", command=self._save, bg=CONTROL, fg=TEXT,
+                  relief="flat", padx=10).pack(side="left", padx=4)
+        tk.Button(btn_frame, text="Cancel", command=self._cancel, bg=CONTROL, fg=TEXT,
+                  relief="flat", padx=10).pack(side="left")
+
+    def _save(self):
+        name = self.profile_var.get().strip()
+        if not name:
+            self.error_label.configure(text="Choose a profile to launch.")
+            return
+        self.result = {
+            "profile": name,
+            "hour": max(0, min(23, int(self.hour_var.get() or 0))),
+            "minute": max(0, min(59, int(self.minute_var.get() or 0))),
+            "days": [i for i, v in enumerate(self.day_vars) if v.get()],
+            "enabled": bool(self.enabled_var.get()),
+        }
         self.destroy()
 
 
@@ -2746,6 +3004,9 @@ class MultiRobloxApp:
         self._settings_save_job = None
         self._last_fps_check = 0.0
         self._screenshot_job = None
+        self._hang_since = {}   # pid -> when it was first seen hung
+        self._scheduler_job = None
+        self._schedule_last_fired = {}   # schedule index -> "YYYY-MM-DD HH:MM" last fired
 
         self._build_ui()
 
@@ -2778,6 +3039,7 @@ class MultiRobloxApp:
         self.refresh_sessions()
         self._schedule_refresh()
         self._schedule_screenshots()
+        self._schedule_scheduler_tick()
         for p in self.profiles:
             if (p.get("place_id") or "").strip():
                 self.ensure_game_info(p["place_id"], refresh_list=False)
@@ -2946,13 +3208,22 @@ class MultiRobloxApp:
         self.toggle = ToggleSwitch(switch_frame, command=self.on_toggle)
         self.toggle.pack(side="left")
 
+        update_row = tk.Frame(header, bg=BG)
+        update_row.grid(row=2, column=1, columnspan=2, sticky="w", pady=(4, 0))
         self.update_banner = tk.Label(
-            header, bg=BG, fg=BLUE, font=(FONT_FAMILY, 9, "underline"),
+            update_row, bg=BG, fg=BLUE, font=(FONT_FAMILY, 9, "underline"),
             cursor="hand2")
-        self.update_banner.grid(row=2, column=1, columnspan=2, sticky="w", pady=(4, 0))
+        self.update_banner.pack(side="left")
         self._update_url = None
         self.update_banner.bind("<Button-1>", self._open_update_url)
-        self.update_banner.grid_remove()
+        self.update_download_btn = tk.Label(
+            update_row, text="  [Download & Verify]", bg=BG, fg=GREEN,
+            font=(FONT_FAMILY, 9, "underline"), cursor="hand2")
+        self.update_download_btn.pack(side="left")
+        self.update_download_btn.bind("<Button-1>",
+                                      lambda e: self._start_update_download())
+        update_row.grid_remove()
+        self._update_row = update_row
 
         # ---- Tabs ----
         self.notebook = ttk.Notebook(self.root)
@@ -2961,15 +3232,18 @@ class MultiRobloxApp:
         self.tab_launcher = tk.Frame(self.notebook, bg=BG)
         self.tab_instances = tk.Frame(self.notebook, bg=BG)
         self.tab_sessions = tk.Frame(self.notebook, bg=BG)
+        self.tab_scheduler = tk.Frame(self.notebook, bg=BG)
         self.tab_settings = tk.Frame(self.notebook, bg=BG)
         self.notebook.add(self.tab_launcher, text="  Launcher  ")
         self.notebook.add(self.tab_instances, text="  Instances  ")
         self.notebook.add(self.tab_sessions, text="  History  ")
+        self.notebook.add(self.tab_scheduler, text="  Scheduler  ")
         self.notebook.add(self.tab_settings, text="  Settings  ")
 
         self._build_launcher_tab(self.tab_launcher)
         self._build_instances_tab(self.tab_instances)
         self._build_sessions_tab(self.tab_sessions)
+        self._build_scheduler_tab(self.tab_scheduler)
         self._build_settings_tab(self.tab_settings)
         try:
             self.notebook.select(int(self.settings.get("last_tab", 0)))
@@ -3075,6 +3349,15 @@ class MultiRobloxApp:
 
         filter_row = tk.Frame(top_row, bg=PANEL)
         filter_row.grid(row=0, column=1, sticky="e")
+        tk.Label(filter_row, text="Group:", bg=PANEL, fg=SUBTEXT,
+                 font=(FONT_FAMILY, 8)).pack(side="left", padx=(0, 4))
+        self.profile_group_var = tk.StringVar(value="All groups")
+        self.profile_group_filter = ttk.Combobox(
+            filter_row, textvariable=self.profile_group_var, width=12,
+            state="readonly", values=["All groups"])
+        self.profile_group_filter.pack(side="left", padx=(0, 8))
+        self.profile_group_var.trace_add(
+            "write", lambda *_: self.refresh_profile_list())
         tk.Label(filter_row, text="Filter:", bg=PANEL, fg=SUBTEXT,
                  font=(FONT_FAMILY, 8)).pack(side="left", padx=(0, 4))
         self.profile_filter_var = tk.StringVar(value="")
@@ -3113,6 +3396,9 @@ class MultiRobloxApp:
         btn_col.grid(row=0, column=1, sticky="n")
         self.btn_add = self.make_button(btn_col, "Add", self.add_profile)
         self.btn_add.pack(fill="x", pady=2)
+        self.btn_bulk_import = self.make_button(btn_col, "Bulk Import",
+                                                self.bulk_import_profiles)
+        self.btn_bulk_import.pack(fill="x", pady=2)
         self.btn_edit = self.make_button(btn_col, "Edit", self.edit_profile)
         self.btn_edit.pack(fill="x", pady=2)
         self.btn_remove = self.make_button(btn_col, "Remove", self.remove_profile)
@@ -3373,6 +3659,155 @@ class MultiRobloxApp:
         except Exception as ex:
             self.log("Couldn't open %s: %s" % (path, ex))
 
+    # ---------------- Scheduler tab ----------------
+    def _build_scheduler_tab(self, parent):
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(0, weight=1)
+
+        outer, body = self._card(parent, "Scheduled Launches")
+        outer.grid(row=0, column=0, sticky="nsew", padx=2, pady=(8, 2))
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(1, weight=1)
+
+        tk.Label(body, text="Launch a saved profile automatically at a time of "
+                            "day, without Windows Task Scheduler. Only checked "
+                            "while MultiRoblox is running.",
+                 bg=PANEL, fg=SUBTEXT, font=(FONT_FAMILY, 8), wraplength=520,
+                 justify="left").grid(row=0, column=0, sticky="w", pady=(0, 8))
+
+        list_row = tk.Frame(body, bg=PANEL)
+        list_row.grid(row=1, column=0, sticky="nsew")
+        list_row.columnconfigure(0, weight=1)
+        list_row.rowconfigure(0, weight=1)
+
+        list_wrap = tk.Frame(list_row, bg=PANEL)
+        list_wrap.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+        list_wrap.columnconfigure(0, weight=1)
+        list_wrap.rowconfigure(0, weight=1)
+
+        self.schedule_listbox = tk.Listbox(
+            list_wrap, selectmode=tk.SINGLE, bg=CONTROL, fg=TEXT,
+            highlightthickness=1, highlightbackground=BORDER, relief="flat",
+            activestyle="none", height=8, selectbackground="#3a5c78",
+            font=(FONT_FAMILY, 9))
+        self.schedule_listbox.grid(row=0, column=0, sticky="nsew")
+        sched_scroll = ttk.Scrollbar(list_wrap, orient="vertical",
+                                     command=self.schedule_listbox.yview)
+        self.schedule_listbox.configure(yscrollcommand=sched_scroll.set)
+        sched_scroll.grid(row=0, column=1, sticky="ns")
+        self.schedule_listbox.bind("<Double-Button-1>",
+                                   lambda e: self.edit_scheduled_launch())
+
+        btn_col = tk.Frame(list_row, bg=PANEL)
+        btn_col.grid(row=0, column=1, sticky="n")
+        self.make_button(btn_col, "Add", self.add_scheduled_launch).pack(
+            fill="x", pady=2)
+        self.make_button(btn_col, "Edit", self.edit_scheduled_launch).pack(
+            fill="x", pady=2)
+        self.make_button(btn_col, "Remove", self.remove_scheduled_launch).pack(
+            fill="x", pady=2)
+
+        self._refresh_schedule_list()
+
+    def _refresh_schedule_list(self):
+        self.schedule_listbox.delete(0, tk.END)
+        for entry in self.settings.get("scheduled_launches", []):
+            days = entry.get("days") or []
+            when = "%02d:%02d" % (int(entry.get("hour", 0)),
+                                  int(entry.get("minute", 0)))
+            day_text = "daily" if not days else ",".join(
+                DAY_NAMES[d] for d in sorted(days) if 0 <= d < 7)
+            line = "%s  ·  %s  ·  %s" % (when, entry.get("profile", "?"), day_text)
+            if not entry.get("enabled", True):
+                line += "  ·  (disabled)"
+            self.schedule_listbox.insert(tk.END, line)
+
+    def add_scheduled_launch(self):
+        names = [p.get("name", "") for p in self.profiles if p.get("name")]
+        if not names:
+            self.log("Save a profile first, then schedule it.")
+            return
+        dlg = ScheduleDialog(self.root, names)
+        self.root.wait_window(dlg)
+        if dlg.result:
+            self.settings.setdefault("scheduled_launches", []).append(dlg.result)
+            save_settings(self.settings)
+            self._refresh_schedule_list()
+            self.log("Scheduled \"%s\" for %02d:%02d." % (
+                dlg.result["profile"], dlg.result["hour"], dlg.result["minute"]))
+
+    def edit_scheduled_launch(self):
+        sel = self.schedule_listbox.curselection()
+        if not sel:
+            self.log("Select a scheduled launch to edit first.")
+            return
+        idx = sel[0]
+        entries = self.settings.get("scheduled_launches", [])
+        if idx >= len(entries):
+            return
+        existing = entries[idx]
+        names = [p.get("name", "") for p in self.profiles if p.get("name")]
+        dlg = ScheduleDialog(self.root, names, existing.get("profile", ""),
+                            existing.get("hour", 8), existing.get("minute", 0),
+                            existing.get("days", []), existing.get("enabled", True))
+        self.root.wait_window(dlg)
+        if dlg.result:
+            entries[idx] = dlg.result
+            save_settings(self.settings)
+            self._refresh_schedule_list()
+
+    def remove_scheduled_launch(self):
+        sel = self.schedule_listbox.curselection()
+        if not sel:
+            self.log("Select a scheduled launch to remove first.")
+            return
+        idx = sel[0]
+        entries = self.settings.get("scheduled_launches", [])
+        if idx >= len(entries):
+            return
+        removed = entries.pop(idx)
+        self._schedule_last_fired.pop(idx, None)
+        save_settings(self.settings)
+        self._refresh_schedule_list()
+        self.log("Removed the schedule for \"%s\"." % removed.get("profile", "?"))
+
+    def _schedule_scheduler_tick(self):
+        if self.closing:
+            return
+        self._scheduler_job = self.root.after(20000, self._check_scheduled_launches)
+
+    def _check_scheduled_launches(self):
+        # Reschedule first, unconditionally - one bad entry must not stop
+        # every future check.
+        self._schedule_scheduler_tick()
+        now = time.localtime()
+        hhmm = "%02d:%02d" % (now.tm_hour, now.tm_min)
+        fired_key = "%04d-%02d-%02d %s" % (now.tm_year, now.tm_mon, now.tm_mday, hhmm)
+        weekday = now.tm_wday  # Monday = 0, matches DAY_NAMES order
+        for idx, entry in enumerate(self.settings.get("scheduled_launches", [])):
+            if not entry.get("enabled", True):
+                continue
+            if "%02d:%02d" % (int(entry.get("hour", 0)),
+                              int(entry.get("minute", 0))) != hhmm:
+                continue
+            days = entry.get("days") or []
+            if days and weekday not in days:
+                continue
+            if self._schedule_last_fired.get(idx) == fired_key:
+                continue
+            self._schedule_last_fired[idx] = fired_key
+            name = entry.get("profile", "")
+            if not any(p.get("name") == name for p in self.profiles):
+                self.log("Scheduled launch skipped: no saved profile named "
+                         '"%s" (renamed or removed?).' % name)
+                continue
+            if self.busy:
+                self.log('Scheduled launch for "%s" skipped - already busy '
+                         "launching something." % name)
+                continue
+            self.log('Scheduled launch: "%s" (%s)' % (name, hhmm))
+            self.launch_profile_by_name(name)
+
     # ---------------- Settings tab ----------------
     def _build_settings_tab(self, parent):
         parent.columnconfigure(0, weight=1)
@@ -3588,6 +4023,17 @@ class MultiRobloxApp:
                  bg=PANEL, fg=SUBTEXT, font=(FONT_FAMILY, 8), justify="left").grid(
             row=row, column=0, columnspan=3, sticky="w", pady=(0, 4))
         row += 1
+
+        self.hang_detection_var = tk.BooleanVar(
+            value=bool(self.settings.get("hang_detection_enabled", False)))
+        full(self._check(body, "Restart a client if Windows reports it as "
+                               "unresponsive (like Task Manager's \"Not Responding\")",
+                         self.hang_detection_var, self._on_setting_changed))
+        self.hang_seconds_var = tk.IntVar(
+            value=int(self.settings.get("hang_kill_after_seconds", 30)))
+        labelled("...after being unresponsive for (seconds):",
+                 self._spin(body, self.hang_seconds_var, 5, 300, width=6, increment=5),
+                 "a loading screen can look unresponsive briefly - keep this generous")
 
         # --- cpu ---
         section("CPU")
@@ -3819,7 +4265,8 @@ class MultiRobloxApp:
                     self.rejoin_max_var, self.rejoin_cooldown_var,
                     self.rejoin_reset_var, self.ticket_gap_var,
                     self.tile_monitor_var, self.cpu_cap_var, self.ui_scale_var,
-                    self.screenshot_interval_var, self.refresh_interval_var):
+                    self.screenshot_interval_var, self.refresh_interval_var,
+                    self.hang_seconds_var):
             var.trace_add("write", lambda *_: self._on_setting_changed())
 
         self.root.after(120, _resize_scrollregion)
@@ -3859,9 +4306,9 @@ class MultiRobloxApp:
             return
         self._update_url = url
         self.update_banner.configure(
-            text="MultiRoblox %s is available (you have %s) - click to download"
-                 % (version, APP_VERSION))
-        self.update_banner.grid()
+            text="MultiRoblox %s is available (you have %s) - click for the "
+                 "release page" % (version, APP_VERSION))
+        self._update_row.grid()
 
     def _open_update_url(self, _event=None):
         if self._update_url:
@@ -3869,6 +4316,45 @@ class MultiRobloxApp:
                 os.startfile(self._update_url)
             except Exception:
                 pass
+
+    def _start_update_download(self, _event=None):
+        if getattr(self, "_update_downloading", False):
+            return
+        self._update_downloading = True
+        self.update_download_btn.configure(text="  [Downloading 0%...]", fg=SUBTEXT)
+
+        def on_progress(done, total):
+            if total:
+                pct = min(100, int(done * 100 / total))
+                text = "  [Downloading %d%%...]" % pct
+            else:
+                text = "  [Downloading %d KB...]" % (done // 1024)
+            self.root.after(0, lambda: self.update_download_btn.configure(text=text))
+
+        def worker():
+            dest_dir = os.path.join(os.path.expanduser("~"), "Downloads")
+            if not os.path.isdir(dest_dir):
+                dest_dir = config_dir()
+            path, error = download_verified_update(dest_dir, progress_cb=on_progress)
+            self.root.after(0, lambda: self._finish_update_download(path, error))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_update_download(self, path, error):
+        self._update_downloading = False
+        self.update_download_btn.configure(text="  [Download & Verify]", fg=GREEN)
+        if error:
+            self.log("Update download failed: %s" % error)
+            messagebox.showerror("Download failed", error)
+            return
+        self.log("Downloaded and verified MultiRoblox update: %s "
+                 "(SHA-256 matched the published release) - it hasn't been "
+                 "run or installed. Close MultiRoblox and run it yourself "
+                 "when you're ready." % path)
+        try:
+            subprocess.Popen(["explorer", "/select,", path])
+        except Exception:
+            pass
 
     # ---------------- settings plumbing ----------------
     def _on_setting_changed(self, *_args):
@@ -3914,6 +4400,10 @@ class MultiRobloxApp:
                 1, int(self.screenshot_interval_var.get()))
             self.settings["refresh_interval_seconds"] = max(
                 1.0, float(self.refresh_interval_var.get()))
+            self.settings["hang_detection_enabled"] = bool(
+                self.hang_detection_var.get())
+            self.settings["hang_kill_after_seconds"] = max(
+                5, int(self.hang_seconds_var.get()))
         except (ValueError, tk.TclError, AttributeError):
             # a spinbox mid-edit can be empty or partially typed - ignore
             return
@@ -4636,6 +5126,7 @@ class MultiRobloxApp:
                            ("audio focus",
                             lambda: self._apply_audio_focus(procs, front)),
                            ("frame-rate cap", lambda: self._reassert_fps_cap(procs)),
+                           ("hang detection", self._check_hung_instances),
                            ("status summary", self._update_summary)):
             try:
                 step()
@@ -4765,6 +5256,46 @@ class MultiRobloxApp:
         ok, msg = apply_fps_cap(cap)
         if ok:
             self.log("Frame-rate cap had drifted - reapplied: %s" % msg)
+
+    def _check_hung_instances(self):
+        """Notices a Roblox window Windows itself considers unresponsive
+        and, once it's stayed that way for a while (not just a loading-
+        screen blip), force-kills it. Deliberately does NOT touch
+        pid_labels - the watcher then discovers the departure exactly like
+        any other crash, and the existing auto-rejoin logic takes it from
+        there, so this reuses machinery that's already there rather than
+        inventing a second relaunch path."""
+        if not self.settings.get("hang_detection_enabled"):
+            if self._hang_since:
+                self._hang_since.clear()
+            return
+        if psutil is None:
+            return
+        threshold = max(5, int(self.settings.get("hang_kill_after_seconds", 30)))
+        windows = get_window_map()
+        seen = set()
+        for pid, (hwnd, _title) in windows.items():
+            if pid not in self.pid_labels:
+                continue  # only watch clients this app actually launched
+            seen.add(pid)
+            if is_window_hung(hwnd):
+                since = self._hang_since.setdefault(pid, time.time())
+                elapsed = time.time() - since
+                if elapsed >= threshold:
+                    label = self.pid_labels.get(pid, "PID %d" % pid)
+                    self.log('"%s" (PID %d) has been unresponsive for %d '
+                             "second(s) - restarting it."
+                             % (label, pid, int(elapsed)))
+                    try:
+                        psutil.Process(pid).kill()
+                    except Exception as ex:
+                        self.log("  couldn't restart it: %s" % ex)
+                    self._hang_since.pop(pid, None)
+            else:
+                self._hang_since.pop(pid, None)
+        for pid in list(self._hang_since):
+            if pid not in seen:
+                self._hang_since.pop(pid, None)
 
     def _unmute_all(self):
         if AudioUtilities is None:
@@ -5116,10 +5647,20 @@ class MultiRobloxApp:
         query = ""
         if hasattr(self, "profile_filter_var"):
             query = self.profile_filter_var.get().strip().lower()
+        if hasattr(self, "profile_group_filter"):
+            self._refresh_group_filter_options()
+        wanted_group = ""
+        if hasattr(self, "profile_group_var"):
+            wanted_group = self.profile_group_var.get().strip()
+            if wanted_group == "All groups":
+                wanted_group = ""
 
         self.profile_listbox.delete(0, tk.END)
         self._profile_index_map = []
         for real_idx, p in enumerate(self.profiles):
+            group = (p.get("group") or "").strip()
+            if wanted_group and group != wanted_group:
+                continue
             state = p.get("_cookie_ok")           # None = unknown / not checked
             if not p.get("cookie"):
                 suffix, colour = "  ·  guest", SUBTEXT
@@ -5141,7 +5682,10 @@ class MultiRobloxApp:
                                               "" if p["cores"] == 1 else "s")
             if p.get("auto_rejoin"):
                 suffix += "  ·  auto-rejoin"
-            line = p.get("name", "Unnamed") + suffix
+            name_part = p.get("name", "Unnamed")
+            if group:
+                name_part = "[%s] %s" % (group, name_part)
+            line = name_part + suffix
             if query and query not in line.lower():
                 continue
             self.profile_listbox.insert(tk.END, line)
@@ -5151,6 +5695,18 @@ class MultiRobloxApp:
                                                 foreground=colour)
             except Exception:
                 pass
+
+    def _refresh_group_filter_options(self):
+        """Keeps the group filter dropdown's choices in sync with whatever
+        groups actually exist on saved profiles right now."""
+        groups = sorted({(p.get("group") or "").strip()
+                         for p in self.profiles if (p.get("group") or "").strip()})
+        values = ["All groups"] + groups
+        if tuple(self.profile_group_filter["values"]) != tuple(values):
+            current = self.profile_group_var.get()
+            self.profile_group_filter["values"] = values
+            if current not in values:
+                self.profile_group_var.set("All groups")
 
     def _selected_profile_indices(self):
         """The current listbox selection, translated from (possibly
@@ -5504,6 +6060,41 @@ class MultiRobloxApp:
                 self.refresh_profile_list()
                 self.log("Saved profile: " + dlg.result["name"])
 
+    def bulk_import_profiles(self):
+        if not self.storage_enabled:
+            return
+        dlg = BulkImportDialog(self.root)
+        self.root.wait_window(dlg)
+        if not dlg.result:
+            return
+        group = (getattr(dlg, "group", "") or "").strip()
+        existing_names = {p.get("name") for p in self.profiles}
+        added, short_cookies = 0, 0
+        for name, cookie in dlg.result:
+            base = name
+            n = 2
+            while name in existing_names:
+                name = "%s (%d)" % (base, n)
+                n += 1
+            existing_names.add(name)
+            if cookie and cookie_warning(cookie):
+                short_cookies += 1
+            profile = {"name": name, "cookie": cookie, "place_id": "",
+                      "link_code": "", "job_id": "", "auto_rejoin": False,
+                      "allow_guest_fallback": False, "cores": 0, "monitor": 0,
+                      "group": group}
+            if cookie:
+                profile["cookie_saved"] = time.time()
+            self.profiles.append(profile)
+            added += 1
+        if added and self._persist_profiles():
+            self.refresh_profile_list()
+            msg = "Imported %d profile(s)." % added
+            if short_cookies:
+                msg += (" %d looked malformed or short - check them with "
+                       "Test Cookie before launching." % short_cookies)
+            self.log(msg)
+
     def edit_profile(self):
         if not self.storage_enabled:
             return
@@ -5520,7 +6111,8 @@ class MultiRobloxApp:
                             existing.get("cores", 0),
                             existing.get("allow_guest_fallback", False),
                             existing.get("monitor", 0),
-                            existing.get("job_id", ""))
+                            existing.get("job_id", ""),
+                            existing.get("group", ""))
         self.root.wait_window(dlg)
         if dlg.result:
             dlg.result["_cookie_ok"] = None
@@ -6060,6 +6652,11 @@ class MultiRobloxApp:
         if self._screenshot_job:
             try:
                 self.root.after_cancel(self._screenshot_job)
+            except Exception:
+                pass
+        if self._scheduler_job:
+            try:
+                self.root.after_cancel(self._scheduler_job)
             except Exception:
                 pass
         if self._settings_save_job:
